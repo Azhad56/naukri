@@ -84,9 +84,22 @@ data/            runtime profile, logs, caches (gitignored)
 
 ## Note on the screening-question widget
 
-The recorded walkthrough this automation was built from never triggered
-Naukri's chatbot-style screening-question widget (most jobs applied
-instantly). `chatbot.js` handles it defensively with broad, text/role-based
-selectors — watch the console `[CHATBOT] ...` output on your first real
+`chatbot.js` handles two confirmed variants of Naukri's post-Apply
+screening-question widget, answering one question at a time and clicking
+**Save** after each (with a short 1–2s "breath" pause before every Save,
+mirroring natural human pacing):
+
+- **Yes/No questions** (relocate, residency, hybrid/WFH, interview
+  availability, notice period, work authorization, etc.) — these always
+  get **Yes**, since a "No" here is often an instant auto-reject and
+  answering Yes maximizes shortlist odds.
+- **Free-text chat questions** ("What is your current CTC and expected
+  annual CTC in INR?", "How many years of experience do you have in
+  React?", etc.) — answered from the resume-based Q&A bank (`qaBank.js`),
+  falling back to the local Ollama model (`aiFallback.js`) for anything
+  unrecognized, then typed character-by-character into the chat's
+  "Type message here..." box.
+
+Watch the console `[CHATBOT] ...` / `[Q&A:...]` output on your first real
 run and tighten the selectors in `chatbot.js` if your account sees a
 differently-structured widget.

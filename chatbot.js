@@ -1,38 +1,38 @@
 /**
  * Handles Naukri's post-Apply screening chatbot.
  *
- * Two common variants (confirmed from live screenshots):
- *  A) Yes / No / Skip this question  (relocate / reside)
- *  B) Yes / No only                   (interview availability, F2F, etc.)
+ * Two common variants (confirmed from live screenshots/recordings):
+ *  A) Yes / No / Skip this question   (relocate / reside / interview availability)
+ *  B) Free-text chat questions        ("What is your current CTC...",
+ *     "How many years of experience do you have in X?") answered via a
+ *     "Type message here..." input, one question at a time, each confirmed
+ *     with a "Save" button.
  *
- * Soft screening questions ALWAYS get Yes → higher shortlist odds.
+ * Soft Yes/No screening questions ALWAYS get Yes → higher shortlist odds.
+ * Free-text questions are answered from the resume-based Q&A bank, with the
+ * local AI model as fallback for anything qaBank.js doesn't recognize.
  */
 import { CONFIG } from "./config.js";
 import { matchKnownAnswer } from "./qaBank.js";
-import { humanClick, humanDelay, sleep } from "./humanize.js";
+import { resolveWithAI } from "./aiFallback.js";
+import { humanClick, humanType, humanDelay, sleep } from "./humanize.js";
 import { logAnswer } from "./logger.js";
 
+const TEXT_INPUT_SELECTOR =
+  'input[placeholder*="type message" i], textarea[placeholder*="type message" i]';
+
 /**
- * The chatbot panel. Prefer the "Skip this question" variant when present;
- * otherwise match a panel that has both Yes + No option cards and a Save button.
+ * The chatbot panel: any container with a visible "Save" button — covers
+ * both the Yes/No variant and the free-text chat variant.
  */
 function chatPanel(page) {
-  const withSkip = page
-    .locator("div, section, aside")
-    .filter({ hasText: /skip this question/i })
-    .filter({ hasText: /\?/ });
-  const withYesNoSave = page
+  return page
     .locator("div, section, aside")
     .filter({ has: page.getByRole("button", { name: /^save$/i }) })
-    .filter({ hasText: /^yes$/i })
-    .filter({ hasText: /^no$/i });
-
-  // Prefer skip-variant if visible, else yes/no+save panel
-  return withSkip.or(withYesNoSave).last();
+    .last();
 }
 
 async function isChatOpen(page) {
-  // Fast path: Save button near Yes/No options (chatbot footer, not bookmark)
   const panels = page.locator("div, section, aside").filter({
     has: page.getByRole("button", { name: /^save$/i }),
   });
@@ -41,13 +41,16 @@ async function isChatOpen(page) {
     const p = panels.nth(i);
     if (!(await p.isVisible().catch(() => false))) continue;
     const text = (await p.innerText().catch(() => "")).toLowerCase();
-    const hasYes = /\byes\b/.test(text);
-    const hasNo = /\bno\b/.test(text);
     const hasQuestion =
       /\?/.test(text) ||
       /skip this question/i.test(text) ||
       /relocat|resid|interview|available|f2f|willing|comfortable/i.test(text);
-    if (hasYes && hasNo && hasQuestion) return true;
+    const hasYesNo = /\byes\b/.test(text) && /\bno\b/.test(text);
+    const hasTextInput = await p
+      .locator(TEXT_INPUT_SELECTOR)
+      .count()
+      .catch(() => 0);
+    if (hasQuestion && (hasYesNo || hasTextInput)) return true;
   }
   return false;
 }
@@ -61,18 +64,36 @@ async function getOpenPanel(page) {
     const p = panels.nth(i);
     if (!(await p.isVisible().catch(() => false))) continue;
     const text = (await p.innerText().catch(() => "")).toLowerCase();
-    if (/\byes\b/.test(text) && /\bno\b/.test(text)) return p;
+    const hasYesNo = /\byes\b/.test(text) && /\bno\b/.test(text);
+    const hasTextInput = await p
+      .locator(TEXT_INPUT_SELECTOR)
+      .count()
+      .catch(() => 0);
+    if (hasYesNo || hasTextInput) return p;
   }
   return chatPanel(page);
 }
 
+/** In the free-text chat variant, several Q/A bubbles from earlier in the
+ * conversation remain visible above the current one — grab the LAST
+ * question-shaped sentence, since that's always the one still awaiting
+ * an answer. */
 async function readQuestion(panel) {
-  const text = (await panel.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
-  const m =
-    text.match(
-      /((?:Are you|Do you|Have you|Would you|Can you|Will you|Should be)[^?]{5,280}\??)/i
-    ) || text.match(/([^?\n]{15,280}\?)/);
-  return m ? m[1].trim() : text.slice(0, 200);
+  const text = (await panel.innerText().catch(() => "")).replace(/[ \t]+/g, " ").trim();
+  const matches = [...text.matchAll(/([^?\n]{5,280}\?)/g)];
+  if (matches.length) return matches[matches.length - 1][1].trim();
+  return text.slice(-200);
+}
+
+/** Returns the visible "Type message here..." input for the free-text chat
+ * variant, or null if this question is a Yes/No (button-based) one. */
+async function findAnswerInput(panel) {
+  const input = panel.locator(TEXT_INPUT_SELECTOR);
+  if (await input.count().catch(() => 0)) {
+    const el = input.last();
+    if (await el.isVisible().catch(() => false)) return el;
+  }
+  return null;
 }
 
 async function clickYes(page, panel) {
@@ -121,6 +142,10 @@ async function clickSave(page, panel) {
     await sleep(200);
   }
 
+  // Take a little "breath" before saving — mirrors how a real person
+  // briefly pauses after typing/selecting an answer before confirming it.
+  await humanDelay(1000, 2000);
+
   await humanClick(page, saveBtn).catch(() => saveBtn.click({ force: true }));
   await humanDelay(800, 1600);
   return true;
@@ -131,15 +156,40 @@ async function answerCurrentQuestion(page, jobContext) {
   if (!(await panel.isVisible().catch(() => false))) return false;
 
   const question = await readQuestion(panel);
-  let answer = matchKnownAnswer(question, { type: "radio", options: ["Yes", "No"] }) || "Yes";
-  if (/^no$/i.test(String(answer)) || /skip/i.test(String(answer))) answer = "Yes";
+  const textInput = await findAnswerInput(panel);
 
-  logAnswer(jobContext, question || "(chatbot question)", answer, "qa-bank-yes");
+  if (textInput) {
+    // Free-text chat question, e.g. "What is your current CTC and expected
+    // annual CTC in INR?" or "How many years of experience do you have in
+    // React?" — answered from the resume-based Q&A bank, falling back to
+    // the local AI model for anything qaBank.js doesn't recognize.
+    let answer = matchKnownAnswer(question, { type: "text" });
+    let source = "qa-bank";
+    if (answer == null) {
+      const resolved = await resolveWithAI(question, { type: "text" }, jobContext);
+      if (!resolved) {
+        console.log("  [CHATBOT] No known/AI answer for free-text question — leaving for manual review.");
+        return false;
+      }
+      answer = resolved.answer;
+      source = resolved.source;
+    }
 
-  if (!(await clickYes(page, panel))) {
-    console.log("  [CHATBOT] Could not click Yes option");
-    return false;
+    logAnswer(jobContext, question || "(chatbot question)", answer, source);
+    await humanType(page, textInput, String(answer));
+  } else {
+    // Yes/No screening question — soft bias toward "Yes" for shortlist odds.
+    let answer = matchKnownAnswer(question, { type: "radio", options: ["Yes", "No"] }) || "Yes";
+    if (/^no$/i.test(String(answer)) || /skip/i.test(String(answer))) answer = "Yes";
+
+    logAnswer(jobContext, question || "(chatbot question)", answer, "qa-bank-yes");
+
+    if (!(await clickYes(page, panel))) {
+      console.log("  [CHATBOT] Could not click Yes option");
+      return false;
+    }
   }
+
   await humanDelay(
     CONFIG.limits.minDelayBetweenFormStepsMs,
     CONFIG.limits.maxDelayBetweenFormStepsMs
@@ -167,7 +217,7 @@ export async function handleScreeningQuestionsIfAny(page, jobContext) {
   }
   if (!seen) return "none";
 
-  console.log("  [CHATBOT] Screening question widget detected — answering Yes...");
+  console.log("  [CHATBOT] Screening question widget detected — answering...");
 
   const MAX_STEPS = 10;
   for (let step = 0; step < MAX_STEPS; step++) {

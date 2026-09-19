@@ -128,6 +128,12 @@ export function matchKnownAnswer(questionText, field = {}) {
     return String(c.noticePeriodDays);
   }
 
+  // Combined free-text chat question, e.g.
+  // "What is your current CTC and expected annual CTC in INR?"
+  if (/current/.test(q) && /expected/.test(q) && /ctc|salary|compensation/.test(q)) {
+    return `CTC - ${c.currentCtcLpa} LPA / ECTC - ${c.expectedCtcLpa} LPA`;
+  }
+
   if (/(current.*(ctc|salary|compensation|pay))/.test(q)) {
     return /lpa|lakh/.test(q) ? String(c.currentCtcLpa) : String(c.currentCtcLpa * 100000);
   }
