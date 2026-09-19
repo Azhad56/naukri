@@ -133,10 +133,11 @@ async function goToNextResultsPage(page) {
   return page.url();
 }
 
-/** Visits a single job detail page and applies, skips, or handles screening questions. */
+/** Visits a single job detail page and applies, skips, or handles screening questions.
+ * @returns {"applied"|"skipped_company_site"|"skipped"|"failed"} */
 async function processJob(page, card, jobContext) {
   await safeGoto(page, card.href);
-  await humanDelay(1200, 2200);
+  await humanDelay(800, 1400);
 
   if (await detectSecurityCheckpoint(page)) throw new Error("SECURITY_CHECKPOINT_DETECTED");
 
@@ -144,21 +145,21 @@ async function processJob(page, card, jobContext) {
   if (await companySiteBtn.count().catch(() => 0)) {
     console.log(`[SKIP] ${jobContext.title} — requires "Apply on company site"`);
     logResult({ ...jobContext, status: "skipped", reason: "apply_on_company_site" });
-    return;
+    return "skipped_company_site";
   }
 
   const alreadyAppliedBtn = page.getByText(/^applied$/i).first();
   if (await alreadyAppliedBtn.count().catch(() => 0)) {
     console.log(`[SKIP] ${jobContext.title} — already applied previously`);
     logResult({ ...jobContext, status: "skipped", reason: "already_applied" });
-    return;
+    return "skipped";
   }
 
   const applyBtn = page.getByRole("button", { name: /^apply$/i }).first();
   if (!(await applyBtn.count().catch(() => 0))) {
     console.log(`[SKIP] ${jobContext.title} — no direct Apply button found`);
     logResult({ ...jobContext, status: "skipped", reason: "no_apply_button" });
-    return;
+    return "skipped";
   }
 
   console.log(`[OPEN] ${jobContext.title}`);
@@ -169,6 +170,7 @@ async function processJob(page, card, jobContext) {
 
   logResult({ ...jobContext, status: "applied", screening: screeningResult });
   console.log(`[APPLIED] ${jobContext.title}${screeningResult === "completed" ? " (answered screening questions)" : ""}`);
+  return "applied";
 }
 
 async function processKeyword(page, keyword, state) {
@@ -210,8 +212,9 @@ async function processKeyword(page, keyword, state) {
 
       const jobContext = { jobUrl: card.href, title: card.title || "Untitled", keyword };
 
+      let outcome = "failed";
       try {
-        await processJob(page, card, jobContext);
+        outcome = await processJob(page, card, jobContext);
       } catch (err) {
         if (err.message === "SECURITY_CHECKPOINT_DETECTED") throw err;
         console.error(`[FAILED] ${jobContext.title}: ${err.message}`);
@@ -219,22 +222,24 @@ async function processKeyword(page, keyword, state) {
         continue;
       }
 
-      // Counts every processed job (applied or skipped) toward the per-keyword
-      // cap so a run doesn't spend all its time re-checking "company site"
-      // jobs; only real applications increment the overall run counter's
-      // pacing logic below, but we still count skips here to keep moving on.
-      handledForKeyword += 1;
-      state.totalApplied += 1;
+      // "Apply on company site" → move on immediately, no delay and don't
+      // burn the per-run application quota / long-break counter on skips.
+      if (outcome === "skipped_company_site") continue;
 
-      if (state.totalApplied > 0 && state.totalApplied % CONFIG.limits.longBreakEvery === 0) {
+      handledForKeyword += 1;
+      if (outcome === "applied") state.totalApplied += 1;
+
+      if (outcome === "applied" && state.totalApplied > 0 && state.totalApplied % CONFIG.limits.longBreakEvery === 0) {
         const breakMs =
           CONFIG.limits.longBreakMinMs +
           Math.floor(Math.random() * (CONFIG.limits.longBreakMaxMs - CONFIG.limits.longBreakMinMs));
         console.log(`\n[BREAK] Taking a longer human-like break: ${Math.round(breakMs / 1000)}s...\n`);
         await sleep(breakMs);
-      } else {
+      } else if (outcome === "applied") {
         await humanDelay(CONFIG.limits.minDelayBetweenJobsMs, CONFIG.limits.maxDelayBetweenJobsMs);
       }
+      // Other skips (already applied / no Apply button) also continue without
+      // the long between-job delay — only real applications pace the run.
     }
 
     console.log(`  -> processed page ${pageNum} (${cards.length} cards)`);
