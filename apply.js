@@ -1,0 +1,321 @@
+/**
+ * Naukri.com job-search + apply automation.
+ *
+ * Logs in via a persisted real Chrome session (see login.js), searches each
+ * configured keyword, applies a Freshness filter + sorts by Date, then
+ * visits each job's detail page directly. Jobs whose CTA is
+ * "Apply on company site" are always skipped (external redirect, per your
+ * requirement) — only jobs with a direct "Apply" button are applied to.
+ * Any optional screening-question widget is answered via the resume-based
+ * Q&A bank, with a local Ollama model as fallback for anything new.
+ *
+ * Prerequisite: run `npm run login` once to save your session.
+ * Run: npm start
+ */
+import { CONFIG } from "./config.js";
+import { launchBrowser, getOrCreatePage } from "./browser.js";
+import { humanClick, humanType, humanDelay, sleep } from "./humanize.js";
+import { handleScreeningQuestionsIfAny } from "./chatbot.js";
+import { logResult, alreadyHandled } from "./logger.js";
+
+async function safeGoto(page, url, opts = {}) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", ...opts });
+      return;
+    } catch (err) {
+      if (attempt === 3) throw err;
+      console.warn(`  navigation retry ${attempt}/3 after error: ${err.message}`);
+      await sleep(2000 * attempt);
+    }
+  }
+}
+
+export async function detectSecurityCheckpoint(page) {
+  const url = page.url();
+  if (/captcha|blocked/i.test(url)) return true;
+  const bodyText = await page.locator("body").innerText().catch(() => "");
+  return /unusual activity|verify you.?re a human|security check|access denied/i.test(bodyText);
+}
+
+/** Fills the homepage search box, picks experience, and submits. */
+async function runSearch(page, keyword) {
+  await safeGoto(page, "https://www.naukri.com/mnjuser/homepage");
+  await humanDelay(1500, 2800);
+
+  const keywordInput = page
+    .locator('input[placeholder="Enter skills / designations / companies"]')
+    .first();
+  await keywordInput.waitFor({ timeout: 15000 });
+  await humanType(page, keywordInput, keyword);
+  await humanDelay(600, 1100);
+  await page.keyboard.press("Escape").catch(() => {}); // close autocomplete dropdown
+
+  if (CONFIG.search.experienceYears) {
+    try {
+      const expControl = page.getByText("Select experience", { exact: false }).first();
+      if (await expControl.count().catch(() => 0)) {
+        await humanClick(page, expControl);
+        await humanDelay(400, 800);
+        const label = /^\d+$/.test(CONFIG.search.experienceYears)
+          ? `${CONFIG.search.experienceYears} year${CONFIG.search.experienceYears === "1" ? "" : "s"}`
+          : CONFIG.search.experienceYears;
+        const option = page.getByText(label, { exact: true }).first();
+        if (await option.count().catch(() => 0)) {
+          await humanClick(page, option);
+        } else {
+          console.warn(`  [WARN] Experience option "${label}" not found — leaving default.`);
+        }
+      }
+    } catch (err) {
+      console.warn(`  [WARN] Could not set experience filter: ${err.message}`);
+    }
+  }
+
+  if (CONFIG.search.location) {
+    try {
+      const locInput = page.locator('input[placeholder="Enter location"]').first();
+      if (await locInput.count().catch(() => 0)) {
+        await humanType(page, locInput, CONFIG.search.location);
+        await humanDelay(400, 800);
+        await page.keyboard.press("Escape").catch(() => {});
+      }
+    } catch (err) {
+      console.warn(`  [WARN] Could not set location filter: ${err.message}`);
+    }
+  }
+
+  const searchBtn = page.getByRole("button", { name: /search/i }).first();
+  await humanClick(page, searchBtn);
+  await page.waitForLoadState("domcontentloaded").catch(() => {});
+  await humanDelay(2000, 3500);
+}
+
+/** Applies the Freshness filter and sorts by the configured order. Best-effort. */
+async function applyFiltersAndSort(page) {
+  if (CONFIG.search.freshness) {
+    try {
+      const freshnessControl = page.getByText("Freshness", { exact: false }).first();
+      if (await freshnessControl.count().catch(() => 0)) {
+        await humanClick(page, freshnessControl);
+        await humanDelay(400, 800);
+        const option = page.getByText(CONFIG.search.freshness, { exact: true }).first();
+        if (await option.count().catch(() => 0)) {
+          await humanClick(page, option);
+          await humanDelay(1200, 2200);
+        } else {
+          console.warn(`  [WARN] Freshness option "${CONFIG.search.freshness}" not found.`);
+        }
+      }
+    } catch (err) {
+      console.warn(`  [WARN] Could not apply freshness filter: ${err.message}`);
+    }
+  }
+
+  if (CONFIG.search.sortBy) {
+    try {
+      const sortControl = page.getByText(/sort by/i).first();
+      if (await sortControl.count().catch(() => 0)) {
+        await humanClick(page, sortControl);
+        await humanDelay(400, 800);
+        const option = page.getByText(CONFIG.search.sortBy, { exact: false }).last();
+        if (await option.count().catch(() => 0)) {
+          await humanClick(page, option);
+          await humanDelay(1200, 2200);
+        } else {
+          console.warn(`  [WARN] Sort option "${CONFIG.search.sortBy}" not found.`);
+        }
+      }
+    } catch (err) {
+      console.warn(`  [WARN] Could not apply sort order: ${err.message}`);
+    }
+  }
+}
+
+/** Reads {href, title} for every job card visible on the current results page. */
+async function collectCards(page) {
+  const anchors = await page.locator("a.title").all();
+  const cards = [];
+  for (const a of anchors) {
+    const href = await a.getAttribute("href").catch(() => null);
+    const title = (await a.innerText().catch(() => "")).split("\n")[0].trim();
+    if (href) cards.push({ href, title });
+  }
+  return cards;
+}
+
+/** Clicks "Next" in the results pagination bar. Returns the new URL, or null if there's no next page. */
+async function goToNextResultsPage(page) {
+  const nextBtn = page
+    .locator('a, button, span')
+    .filter({ hasText: /^next$/i })
+    .last();
+  if (!(await nextBtn.count().catch(() => 0))) return null;
+
+  await nextBtn.scrollIntoViewIfNeeded().catch(() => {});
+  const disabled = await nextBtn
+    .evaluate((el) => el.classList.contains("disabled") || el.getAttribute("aria-disabled") === "true")
+    .catch(() => false);
+  if (disabled) return null;
+
+  await humanClick(page, nextBtn);
+  await page.waitForLoadState("domcontentloaded").catch(() => {});
+  await humanDelay(1800, 3200);
+  return page.url();
+}
+
+/** Visits a single job detail page and applies, skips, or handles screening questions. */
+async function processJob(page, card, jobContext) {
+  await safeGoto(page, card.href);
+  await humanDelay(1200, 2200);
+
+  if (await detectSecurityCheckpoint(page)) throw new Error("SECURITY_CHECKPOINT_DETECTED");
+
+  const companySiteBtn = page.getByRole("button", { name: /apply on company site/i }).first();
+  if (await companySiteBtn.count().catch(() => 0)) {
+    console.log(`[SKIP] ${jobContext.title} — requires "Apply on company site"`);
+    logResult({ ...jobContext, status: "skipped", reason: "apply_on_company_site" });
+    return;
+  }
+
+  const alreadyAppliedBtn = page.getByText(/^applied$/i).first();
+  if (await alreadyAppliedBtn.count().catch(() => 0)) {
+    console.log(`[SKIP] ${jobContext.title} — already applied previously`);
+    logResult({ ...jobContext, status: "skipped", reason: "already_applied" });
+    return;
+  }
+
+  const applyBtn = page.getByRole("button", { name: /^apply$/i }).first();
+  if (!(await applyBtn.count().catch(() => 0))) {
+    console.log(`[SKIP] ${jobContext.title} — no direct Apply button found`);
+    logResult({ ...jobContext, status: "skipped", reason: "no_apply_button" });
+    return;
+  }
+
+  console.log(`[OPEN] ${jobContext.title}`);
+  await humanClick(page, applyBtn);
+  await humanDelay(1000, 2000);
+
+  const screeningResult = await handleScreeningQuestionsIfAny(page, jobContext);
+
+  logResult({ ...jobContext, status: "applied", screening: screeningResult });
+  console.log(`[APPLIED] ${jobContext.title}${screeningResult === "completed" ? " (answered screening questions)" : ""}`);
+}
+
+async function processKeyword(page, keyword, state) {
+  console.log(`\n=== Keyword: "${keyword}" ===`);
+  await runSearch(page, keyword);
+  await applyFiltersAndSort(page);
+
+  let handledForKeyword = 0;
+  let pageNum = 1;
+  let resultsUrl = page.url();
+
+  while (
+    handledForKeyword < CONFIG.limits.maxApplicationsPerKeyword &&
+    state.totalApplied < CONFIG.limits.maxApplicationsPerRun &&
+    pageNum <= CONFIG.limits.maxPagesPerKeyword
+  ) {
+    await safeGoto(page, resultsUrl);
+    await humanDelay(1200, 2000);
+
+    if (await detectSecurityCheckpoint(page)) throw new Error("SECURITY_CHECKPOINT_DETECTED");
+
+    const cards = await collectCards(page);
+    if (!cards.length) {
+      console.log("No job cards found — stopping this keyword.");
+      break;
+    }
+
+    for (const card of cards) {
+      if (handledForKeyword >= CONFIG.limits.maxApplicationsPerKeyword) break;
+      if (state.totalApplied >= CONFIG.limits.maxApplicationsPerRun) break;
+      if (state.seenUrls.has(card.href) || alreadyHandled(card.href)) continue;
+      state.seenUrls.add(card.href);
+
+      const jobContext = { jobUrl: card.href, title: card.title || "Untitled", keyword };
+
+      try {
+        await processJob(page, card, jobContext);
+      } catch (err) {
+        if (err.message === "SECURITY_CHECKPOINT_DETECTED") throw err;
+        console.error(`[FAILED] ${jobContext.title}: ${err.message}`);
+        logResult({ ...jobContext, status: "failed", error: err.message });
+        continue;
+      }
+
+      // Counts every processed job (applied or skipped) toward the per-keyword
+      // cap so a run doesn't spend all its time re-checking "company site"
+      // jobs; only real applications increment the overall run counter's
+      // pacing logic below, but we still count skips here to keep moving on.
+      handledForKeyword += 1;
+      state.totalApplied += 1;
+
+      if (state.totalApplied > 0 && state.totalApplied % CONFIG.limits.longBreakEvery === 0) {
+        const breakMs =
+          CONFIG.limits.longBreakMinMs +
+          Math.floor(Math.random() * (CONFIG.limits.longBreakMaxMs - CONFIG.limits.longBreakMinMs));
+        console.log(`\n[BREAK] Taking a longer human-like break: ${Math.round(breakMs / 1000)}s...\n`);
+        await sleep(breakMs);
+      } else {
+        await humanDelay(CONFIG.limits.minDelayBetweenJobsMs, CONFIG.limits.maxDelayBetweenJobsMs);
+      }
+    }
+
+    console.log(`  -> processed page ${pageNum} (${cards.length} cards)`);
+
+    const nextUrl = await goToNextResultsPage(page);
+    if (!nextUrl) {
+      console.log("No further result pages.");
+      break;
+    }
+    resultsUrl = nextUrl;
+    pageNum += 1;
+  }
+
+  console.log(`Keyword "${keyword}" done.`);
+}
+
+async function main() {
+  console.log("Starting Naukri automation...");
+  console.log(
+    `Limits: ${CONFIG.limits.maxApplicationsPerRun}/run, ${CONFIG.limits.maxApplicationsPerKeyword}/keyword. AI fallback: ${CONFIG.ai.enabled ? CONFIG.ai.model : "disabled"}.`
+  );
+
+  const context = await launchBrowser();
+  const page = await getOrCreatePage(context);
+
+  await safeGoto(page, "https://www.naukri.com/mnjuser/homepage");
+  await sleep(1500);
+
+  if (/nlogin/i.test(page.url())) {
+    console.error("\nNot logged in. Run `npm run login` first, then re-run this.\n");
+    await context.close();
+    process.exit(1);
+  }
+
+  const state = { totalApplied: 0, seenUrls: new Set() };
+
+  try {
+    for (const keyword of CONFIG.search.keywords) {
+      if (state.totalApplied >= CONFIG.limits.maxApplicationsPerRun) break;
+      await processKeyword(page, keyword, state);
+    }
+  } catch (err) {
+    if (err.message === "SECURITY_CHECKPOINT_DETECTED") {
+      console.error(
+        "\n🚨 Naukri showed a security check/captcha. Stopping immediately — please solve it manually in the open browser window, then re-run.\n"
+      );
+    } else {
+      console.error("\nFatal error:", err);
+    }
+  }
+
+  console.log("\n========== SUMMARY ==========");
+  console.log(`Total handled this run: ${state.totalApplied}`);
+  console.log("See ./data/applied-log.json and ./data/needs-review.json for full details.");
+
+  await context.close();
+}
+
+main();

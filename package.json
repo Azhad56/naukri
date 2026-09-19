@@ -1,0 +1,21 @@
+{
+  "name": "naukri-auto-apply",
+  "version": "1.0.0",
+  "description": "Naukri.com job search + apply automation (Playwright + stealth)",
+  "type": "module",
+  "main": "apply.js",
+  "scripts": {
+    "login": "node login.js",
+    "start": "node apply.js",
+    "apply": "node apply.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "pdf-parse": "^1.1.1",
+    "playwright": "^1.63.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}
