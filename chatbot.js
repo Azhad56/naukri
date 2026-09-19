@@ -12,14 +12,41 @@
  * Free-text questions are answered from the resume-based Q&A bank, with the
  * local AI model as fallback for anything qaBank.js doesn't recognize.
  */
+import fs from "node:fs";
+import path from "node:path";
 import { CONFIG } from "./config.js";
 import { matchKnownAnswer } from "./qaBank.js";
 import { resolveWithAI } from "./aiFallback.js";
 import { humanClick, humanType, humanDelay, sleep } from "./humanize.js";
 import { logAnswer } from "./logger.js";
 
-const TEXT_INPUT_SELECTOR =
-  'input[placeholder*="type message" i], textarea[placeholder*="type message" i]';
+// Naukri's chat input isn't always a plain <input placeholder="Type message
+// here...">  — cast a wide net (contenteditable divs, textareas, generic
+// text inputs) so we don't silently mis-classify a text question as a
+// Yes/No one just because the placeholder wording/markup differs.
+const TEXT_INPUT_SELECTOR = [
+  'input[placeholder*="type message" i]',
+  'textarea[placeholder*="type message" i]',
+  'input[placeholder*="type your" i]',
+  'textarea[placeholder*="type your" i]',
+  'input[placeholder*="enter your" i]',
+  'textarea[placeholder*="enter your" i]',
+  '[contenteditable="true"]',
+  'input[type="text"]',
+  "textarea",
+].join(", ");
+
+async function chatDebugScreenshot(page, tag) {
+  try {
+    const dir = path.join(CONFIG.profileDir, "..", "debug");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${Date.now()}-chatbot-${tag}.png`);
+    await page.screenshot({ path: file, fullPage: true });
+    console.log(`  [CHATBOT] Saved screenshot: ${file}`);
+  } catch {
+    // best-effort only
+  }
+}
 
 /**
  * The chatbot panel: any container with a visible "Save" button — covers
@@ -32,7 +59,10 @@ function chatPanel(page) {
     .last();
 }
 
-async function isChatOpen(page) {
+/** Finds the topmost visible panel with a Save button that looks like an
+ * actual open question (Yes/No or free-text), returning both the panel and
+ * a short diagnostic reason string for logging. */
+async function findQuestionPanel(page) {
   const panels = page.locator("div, section, aside").filter({
     has: page.getByRole("button", { name: /^save$/i }),
   });
@@ -46,32 +76,21 @@ async function isChatOpen(page) {
       /skip this question/i.test(text) ||
       /relocat|resid|interview|available|f2f|willing|comfortable/i.test(text);
     const hasYesNo = /\byes\b/.test(text) && /\bno\b/.test(text);
-    const hasTextInput = await p
-      .locator(TEXT_INPUT_SELECTOR)
-      .count()
-      .catch(() => 0);
-    if (hasQuestion && (hasYesNo || hasTextInput)) return true;
+    const hasTextInput = await findAnswerInput(p);
+    if ((hasYesNo || hasTextInput) && hasQuestion) {
+      return { panel: p, hasYesNo, hasTextInput: !!hasTextInput };
+    }
   }
-  return false;
+  return null;
+}
+
+async function isChatOpen(page) {
+  return (await findQuestionPanel(page)) !== null;
 }
 
 async function getOpenPanel(page) {
-  const panels = page.locator("div, section, aside").filter({
-    has: page.getByRole("button", { name: /^save$/i }),
-  });
-  const n = await panels.count().catch(() => 0);
-  for (let i = n - 1; i >= 0; i--) {
-    const p = panels.nth(i);
-    if (!(await p.isVisible().catch(() => false))) continue;
-    const text = (await p.innerText().catch(() => "")).toLowerCase();
-    const hasYesNo = /\byes\b/.test(text) && /\bno\b/.test(text);
-    const hasTextInput = await p
-      .locator(TEXT_INPUT_SELECTOR)
-      .count()
-      .catch(() => 0);
-    if (hasYesNo || hasTextInput) return p;
-  }
-  return chatPanel(page);
+  const found = await findQuestionPanel(page);
+  return found ? found.panel : chatPanel(page);
 }
 
 /** In the free-text chat variant, several Q/A bubbles from earlier in the
@@ -85,15 +104,34 @@ async function readQuestion(panel) {
   return text.slice(-200);
 }
 
-/** Returns the visible "Type message here..." input for the free-text chat
- * variant, or null if this question is a Yes/No (button-based) one. */
+/** Returns the visible chat text input for the free-text variant, or null
+ * if this is a Yes/No (button/radio-based) question. Radio-button panels
+ * never contain a free-text field, so bail out early for those. */
 async function findAnswerInput(panel) {
-  const input = panel.locator(TEXT_INPUT_SELECTOR);
-  if (await input.count().catch(() => 0)) {
-    const el = input.last();
+  const hasRadio = await panel
+    .getByRole("radio")
+    .count()
+    .catch(() => 0);
+  if (hasRadio) return null;
+
+  const candidates = panel.locator(TEXT_INPUT_SELECTOR);
+  const n = await candidates.count().catch(() => 0);
+  for (let i = n - 1; i >= 0; i--) {
+    const el = candidates.nth(i);
     if (await el.isVisible().catch(() => false)) return el;
   }
   return null;
+}
+
+/** Reads back whatever text currently sits in the input/contenteditable so
+ * we can confirm typing actually landed instead of silently no-oping. */
+async function readInputValue(el) {
+  return el
+    .evaluate((node) => {
+      if ("value" in node) return node.value;
+      return node.textContent;
+    })
+    .catch(() => null);
 }
 
 async function clickYes(page, panel) {
@@ -157,6 +195,7 @@ async function answerCurrentQuestion(page, jobContext) {
 
   const question = await readQuestion(panel);
   const textInput = await findAnswerInput(panel);
+  console.log(`  [CHATBOT] Question: "${question}" (${textInput ? "free-text" : "yes/no"})`);
 
   if (textInput) {
     // Free-text chat question, e.g. "What is your current CTC and expected
@@ -166,9 +205,11 @@ async function answerCurrentQuestion(page, jobContext) {
     let answer = matchKnownAnswer(question, { type: "text" });
     let source = "qa-bank";
     if (answer == null) {
+      console.log("  [CHATBOT] qaBank has no rule for this question — trying AI fallback...");
       const resolved = await resolveWithAI(question, { type: "text" }, jobContext);
       if (!resolved) {
         console.log("  [CHATBOT] No known/AI answer for free-text question — leaving for manual review.");
+        await chatDebugScreenshot(page, "unanswerable-text-question");
         return false;
       }
       answer = resolved.answer;
@@ -177,6 +218,23 @@ async function answerCurrentQuestion(page, jobContext) {
 
     logAnswer(jobContext, question || "(chatbot question)", answer, source);
     await humanType(page, textInput, String(answer));
+
+    // Confirm the text actually landed — some widgets need a real
+    // dispatched `input` event, which humanType provides via keyboard.type,
+    // but verify anyway so a silent failure doesn't get logged as "applied".
+    let landed = (await readInputValue(textInput)) || "";
+    if (!landed.trim()) {
+      console.log("  [CHATBOT] Typed text didn't register — retrying with locator.fill()...");
+      await textInput.fill(String(answer)).catch(() => {});
+      await sleep(300);
+      landed = (await readInputValue(textInput)) || "";
+    }
+    console.log(`  [CHATBOT] Input now contains: "${landed.trim()}"`);
+    if (!landed.trim()) {
+      console.log("  [CHATBOT] Could not get any text into the input — leaving for manual review.");
+      await chatDebugScreenshot(page, "text-input-empty-after-type");
+      return false;
+    }
   } else {
     // Yes/No screening question — soft bias toward "Yes" for shortlist odds.
     let answer = matchKnownAnswer(question, { type: "radio", options: ["Yes", "No"] }) || "Yes";
@@ -186,6 +244,7 @@ async function answerCurrentQuestion(page, jobContext) {
 
     if (!(await clickYes(page, panel))) {
       console.log("  [CHATBOT] Could not click Yes option");
+      await chatDebugScreenshot(page, "could-not-click-yes");
       return false;
     }
   }
@@ -195,10 +254,13 @@ async function answerCurrentQuestion(page, jobContext) {
     CONFIG.limits.maxDelayBetweenFormStepsMs
   );
 
+  console.log("  [CHATBOT] Pausing briefly before Save...");
   if (!(await clickSave(page, panel))) {
     console.log("  [CHATBOT] Could not click Save");
+    await chatDebugScreenshot(page, "could-not-click-save");
     return false;
   }
+  console.log("  [CHATBOT] Save clicked.");
   return true;
 }
 
@@ -206,7 +268,9 @@ async function answerCurrentQuestion(page, jobContext) {
  * @returns {"none"|"completed"|"needs_review"}
  */
 export async function handleScreeningQuestionsIfAny(page, jobContext) {
-  const pollDeadline = Date.now() + 5000;
+  // Some popups take a moment to animate in after clicking Apply — give it
+  // a generous window before concluding there's no widget at all.
+  const pollDeadline = Date.now() + 8000;
   let seen = false;
   while (Date.now() < pollDeadline) {
     if (await isChatOpen(page)) {
@@ -218,6 +282,7 @@ export async function handleScreeningQuestionsIfAny(page, jobContext) {
   if (!seen) return "none";
 
   console.log("  [CHATBOT] Screening question widget detected — answering...");
+  await chatDebugScreenshot(page, "widget-detected");
 
   const MAX_STEPS = 10;
   for (let step = 0; step < MAX_STEPS; step++) {
