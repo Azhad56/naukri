@@ -80,6 +80,11 @@ function buildSearchUrl(keyword) {
   });
   if (CONFIG.search.experienceYears) params.set("experience", String(CONFIG.search.experienceYears));
   if (CONFIG.search.location) params.set("l", CONFIG.search.location);
+  // Freshness as a URL param (e.g. jobAge=3 → last 3 days) — same as Naukri's
+  // own filter query string, no UI clicking needed.
+  if (CONFIG.search.jobAge != null && CONFIG.search.jobAge !== "") {
+    params.set("jobAge", String(CONFIG.search.jobAge));
+  }
   return `https://www.naukri.com/${slug}-jobs?${params.toString()}`;
 }
 

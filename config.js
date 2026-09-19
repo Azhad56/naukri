@@ -87,15 +87,13 @@ export const CONFIG = {
       "Backend Developer",
       "Full Stack Developer",
     ]),
-    // Naukri's experience dropdown, e.g. "4" for "4 years". Leave "" to skip.
+    // Naukri's experience query param, e.g. "4" for 4 years. Leave "" to skip.
     experienceYears: process.env.SEARCH_EXPERIENCE_YEARS || "",
     location: process.env.SEARCH_LOCATION || "",
-    // Freshness filter label as shown in the "Freshness" dropdown, e.g.
-    // "Last 3 days", "Last 7 days", "Last 15 days". Empty = don't filter.
-    freshness: process.env.SEARCH_FRESHNESS || "Last 3 days",
-    // Sort dropdown label: "Date" or "Recommended". Naukri defaults to
-    // Recommended; we switch to Date for the freshest results.
-    sortBy: process.env.SEARCH_SORT_BY || "Date",
+    // Freshness as Naukri's `jobAge` query param (days). e.g. 3 = last 3 days.
+    // Empty string disables the filter. Example URL Naukri itself uses:
+    // .../node-dot-js-jobs?k=node.js&experience=4&jobAge=3
+    jobAge: process.env.SEARCH_JOB_AGE ?? "3",
     // Jobs whose CTA reads "Apply on company site" redirect off Naukri —
     // always skipped regardless of this flag; kept for clarity/logging only.
     skipCompanySiteApply: true,

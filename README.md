@@ -53,10 +53,9 @@ For each keyword in `SEARCH_KEYWORDS` it will:
 4. Stops at `MAX_APPLICATIONS_PER_RUN` / `MAX_APPLICATIONS_PER_KEYWORD`, with
    randomized human-like delays and periodic longer breaks throughout.
 
-Note: `SEARCH_FRESHNESS` / `SEARCH_SORT_BY` in `.env` are currently unused —
-filters/sort are intentionally skipped for reliability (the UI widgets for
-these were the main source of flakiness). Only `SEARCH_KEYWORDS`,
-`SEARCH_EXPERIENCE_YEARS`, and `SEARCH_LOCATION` affect the search URL.
+Filters are applied via the URL (no UI clicking):
+`SEARCH_EXPERIENCE_YEARS` → `experience=`, `SEARCH_JOB_AGE` → `jobAge=`
+(e.g. `jobAge=3` = last 3 days), `SEARCH_LOCATION` → `l=`.
 
 If Naukri shows a security check/captcha, the run stops immediately so you
 can solve it manually.
