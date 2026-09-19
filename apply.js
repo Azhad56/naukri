@@ -12,6 +12,8 @@
  * Prerequisite: run `npm run login` once to save your session.
  * Run: npm start
  */
+import fs from "node:fs";
+import path from "node:path";
 import { CONFIG } from "./config.js";
 import { launchBrowser, getOrCreatePage } from "./browser.js";
 import { humanClick, humanType, humanDelay, sleep } from "./humanize.js";
@@ -112,10 +114,31 @@ async function runSearch(page, keyword) {
     }
   }
 
+  const urlBeforeSearch = page.url();
   const searchBtn = page.getByRole("button", { name: /search/i }).first();
   await humanClick(page, searchBtn);
+
+  // Confirm the click actually navigated to results — if something (e.g. a
+  // leftover autocomplete dropdown) ate the click, retry via Enter instead
+  // of silently continuing on the homepage (which is what caused "No job
+  // cards found" for every keyword).
+  const navigated = await page
+    .waitForFunction((prev) => location.href !== prev, urlBeforeSearch, { timeout: 8000 })
+    .then(() => true)
+    .catch(() => false);
+
+  if (!navigated) {
+    console.warn("  [WARN] Search click didn't navigate — retrying with Enter key.");
+    await keywordInput.click({ force: true }).catch(() => {});
+    await page.keyboard.press("Enter").catch(() => {});
+    await page
+      .waitForFunction((prev) => location.href !== prev, urlBeforeSearch, { timeout: 8000 })
+      .catch(() => {});
+  }
+
   await page.waitForLoadState("domcontentloaded").catch(() => {});
   await humanDelay(2000, 3500);
+  console.log(`  [SEARCH] Landed on: ${page.url()}`);
 }
 
 /** Applies the Freshness filter and sorts by the configured order. Best-effort. */
@@ -159,16 +182,41 @@ async function applyFiltersAndSort(page) {
   }
 }
 
-/** Reads {href, title} for every job card visible on the current results page. */
+/** Reads {href, title} for every job card visible on the current results page.
+ * Matches by href pattern first (job detail URLs all look like
+ * naukri.com/job-listings-...) since that's far more stable across Naukri's
+ * frequent class-name/redesign churn than a CSS class like `a.title`. */
 async function collectCards(page) {
-  const anchors = await page.locator("a.title").all();
+  await page
+    .locator('a[href*="/job-listings-"], a.title')
+    .first()
+    .waitFor({ timeout: 10000 })
+    .catch(() => {});
+
+  const anchors = await page.locator('a[href*="/job-listings-"], a.title').all();
+  const seen = new Set();
   const cards = [];
   for (const a of anchors) {
     const href = await a.getAttribute("href").catch(() => null);
+    if (!href || seen.has(href)) continue;
     const title = (await a.innerText().catch(() => "")).split("\n")[0].trim();
-    if (href) cards.push({ href, title });
+    if (!title) continue; // filters out non-title anchors that also match the href pattern
+    seen.add(href);
+    cards.push({ href, title });
   }
   return cards;
+}
+
+async function debugScreenshot(page, tag) {
+  try {
+    const dir = path.join(CONFIG.profileDir, "..", "debug");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${Date.now()}-${tag}.png`);
+    await page.screenshot({ path: file, fullPage: true });
+    console.log(`  [DEBUG] Saved screenshot: ${file}`);
+  } catch {
+    // best-effort only
+  }
 }
 
 /** Clicks "Next" in the results pagination bar. Returns the new URL, or null if there's no next page. */
@@ -236,23 +284,24 @@ async function processKeyword(page, keyword, state) {
 
   let handledForKeyword = 0;
   let pageNum = 1;
-  let resultsUrl = page.url();
 
   while (
     handledForKeyword < CONFIG.limits.maxApplicationsPerKeyword &&
     state.totalApplied < CONFIG.limits.maxApplicationsPerRun &&
     pageNum <= CONFIG.limits.maxPagesPerKeyword
   ) {
-    await safeGoto(page, resultsUrl);
-    await humanDelay(1200, 2000);
-
     if (await detectSecurityCheckpoint(page)) throw new Error("SECURITY_CHECKPOINT_DETECTED");
 
     const cards = await collectCards(page);
     if (!cards.length) {
-      console.log("No job cards found — stopping this keyword.");
+      console.log(`No job cards found — stopping this keyword. (current URL: ${page.url()})`);
+      await debugScreenshot(page, `no-cards-${keyword.replace(/\W+/g, "-")}`);
       break;
     }
+
+    // Capture the results URL now, while we're confidently on the results
+    // page, so we can return to it after visiting each job's detail page.
+    const resultsUrl = page.url();
 
     for (const card of cards) {
       if (handledForKeyword >= CONFIG.limits.maxApplicationsPerKeyword) break;
@@ -291,12 +340,16 @@ async function processKeyword(page, keyword, state) {
 
     console.log(`  -> processed page ${pageNum} (${cards.length} cards)`);
 
+    // processJob() above navigated the page away to job detail URLs —
+    // return to the results listing before looking for pagination controls.
+    await safeGoto(page, resultsUrl);
+    await humanDelay(1000, 1800);
+
     const nextUrl = await goToNextResultsPage(page);
     if (!nextUrl) {
       console.log("No further result pages.");
       break;
     }
-    resultsUrl = nextUrl;
     pageNum += 1;
   }
 
