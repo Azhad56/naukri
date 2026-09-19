@@ -43,9 +43,36 @@ async function runSearch(page, keyword) {
   await safeGoto(page, "https://www.naukri.com/mnjuser/homepage");
   await humanDelay(1500, 2800);
 
-  const keywordInput = page
-    .locator('input[placeholder="Enter skills / designations / companies"]')
-    .first();
+  // On the logged-in homepage, the full keyword/experience/location search
+  // bar starts collapsed into a small "Search jobs here" box in the top
+  // nav. Clicking it expands the real search fields — only then are they
+  // visible/fillable.
+  const keywordSelector = [
+    'input[placeholder="Enter keyword / designation / companies"]',
+    'input[placeholder*="Enter keyword" i]',
+    'input[placeholder*="skills / designations" i]',
+  ].join(", ");
+
+  let keywordInput = page.locator(keywordSelector).first();
+  if (!(await keywordInput.isVisible().catch(() => false))) {
+    const collapsedSearch = page
+      .locator('input[placeholder="Search jobs here"], input[placeholder*="Search jobs" i]')
+      .first();
+    if (await collapsedSearch.count().catch(() => 0)) {
+      await humanClick(page, collapsedSearch);
+      await humanDelay(500, 900);
+    } else {
+      // Fallback: some layouts expand the bar via a search icon/button
+      // instead of a text input.
+      const searchToggle = page.getByRole("button", { name: /search jobs here|^search$/i }).first();
+      if (await searchToggle.count().catch(() => 0)) {
+        await humanClick(page, searchToggle);
+        await humanDelay(500, 900);
+      }
+    }
+    keywordInput = page.locator(keywordSelector).first();
+  }
+
   await keywordInput.waitFor({ timeout: 15000 });
   await humanType(page, keywordInput, keyword);
   await humanDelay(600, 1100);
