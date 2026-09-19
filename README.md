@@ -46,9 +46,13 @@ For each keyword in `SEARCH_KEYWORDS` it will:
    search widget.
 2. Open each job's detail page:
    - **"Apply on company site"** → skipped (external redirect) and logged.
+   - Already-applied jobs are detected and skipped.
+   - Otherwise, **before ever clicking Apply**, extracts Job highlights /
+     description / Role / Key Skills from the page and computes a
+     resume-match percentage (see below). Below `MIN_MATCH_PERCENT` →
+     skipped and logged (`reason: "low_match_score"`), no application spent.
    - **"Apply"** → clicked; any screening-question widget is answered via
      the Q&A bank / AI fallback, then logged as applied.
-   - Already-applied jobs are detected and skipped.
 3. Paginates through results (`Next`) up to `MAX_PAGES_PER_KEYWORD`.
 4. Stops at `MAX_APPLICATIONS_PER_RUN` / `MAX_APPLICATIONS_PER_KEYWORD`, with
    randomized human-like delays and periodic longer breaks throughout.
@@ -56,6 +60,24 @@ For each keyword in `SEARCH_KEYWORDS` it will:
 Filters are applied via the URL (no UI clicking):
 `SEARCH_EXPERIENCE_YEARS` → `experience=`, `SEARCH_JOB_AGE` → `jobAge=`
 (e.g. `jobAge=3` = last 3 days), `SEARCH_LOCATION` → `l=`.
+
+## Resume-match scoring (`jobMatch.js`)
+
+Before clicking Apply on any job, the bot reads the job's **Job highlights**,
+**Job description**, **Role**, and **Key Skills** straight off the detail
+page and scores how well it matches your resume/skills:
+
+1. **Keyword overlap** (always on, instant, no dependencies) — compares the
+   job's Key Skills chips (or the full job text if chips aren't present)
+   against the skills configured in `config.js` (`candidate.skills`).
+2. **AI judgment** (optional, `MATCH_USE_AI=true` + Ollama running) — asks
+   the local model to holistically rate the job against your resume text,
+   averaged in with the keyword score.
+
+Jobs scoring below `MIN_MATCH_PERCENT` (default `30`) are skipped — logged
+in `data/applied-log.json` with `reason: "low_match_score"` — **before any
+application is spent on them**. Watch the console `[MATCH] ...` line on
+each job for the score breakdown.
 
 If Naukri shows a security check/captcha, the run stops immediately so you
 can solve it manually.

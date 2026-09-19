@@ -23,6 +23,7 @@ import { CONFIG } from "./config.js";
 import { launchBrowser, getOrCreatePage } from "./browser.js";
 import { humanClick, humanDelay, sleep } from "./humanize.js";
 import { handleScreeningQuestionsIfAny } from "./chatbot.js";
+import { extractJobDetails, computeMatchScore } from "./jobMatch.js";
 import { logResult, alreadyHandled } from "./logger.js";
 
 async function safeGoto(page, url, opts = {}) {
@@ -159,6 +160,32 @@ async function processJob(page, card, jobContext) {
   if (!(await applyBtn.count().catch(() => 0))) {
     console.log(`[SKIP] ${jobContext.title} — no direct Apply button found`);
     logResult({ ...jobContext, status: "skipped", reason: "no_apply_button" });
+    return "skipped";
+  }
+
+  // Extract Job highlights / description / role / key skills and score the
+  // match against the resume BEFORE ever clicking Apply — don't burn an
+  // application on a job that clearly isn't a fit.
+  const jobDetails = await extractJobDetails(page);
+  const match = await computeMatchScore(jobDetails, jobContext);
+  console.log(
+    `  [MATCH] ${match.score}% (${match.source}${
+      match.aiScore != null ? `: keyword=${match.keywordScore}%, ai=${match.aiScore}%` : ""
+    })${jobDetails.role ? ` — Role: ${jobDetails.role}` : ""}${
+      jobDetails.keySkills.length ? ` — Key Skills: ${jobDetails.keySkills.slice(0, 8).join(", ")}` : ""
+    }`
+  );
+  if (match.score < CONFIG.matching.minMatchPercent) {
+    console.log(
+      `[SKIP] ${jobContext.title} — match ${match.score}% below threshold ${CONFIG.matching.minMatchPercent}%`
+    );
+    logResult({
+      ...jobContext,
+      status: "skipped",
+      reason: "low_match_score",
+      matchScore: match.score,
+      matchSource: match.source,
+    });
     return "skipped";
   }
 

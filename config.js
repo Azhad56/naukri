@@ -99,6 +99,16 @@ export const CONFIG = {
     skipCompanySiteApply: true,
   },
 
+  matching: {
+    // Job is skipped (never clicked Apply) if its computed resume-match
+    // score is below this percentage. See jobMatch.js.
+    minMatchPercent: envInt("MIN_MATCH_PERCENT", 30),
+    // Blend in the local Ollama model's holistic judgment alongside the
+    // deterministic keyword-overlap score. Falls back to keyword-only
+    // automatically if AI is disabled or unreachable.
+    useAI: envBool("MATCH_USE_AI", true),
+  },
+
   limits: {
     maxApplicationsPerRun: envInt("MAX_APPLICATIONS_PER_RUN", 15),
     maxApplicationsPerKeyword: envInt("MAX_APPLICATIONS_PER_KEYWORD", 8),
