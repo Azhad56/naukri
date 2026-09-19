@@ -39,16 +39,24 @@ npm start
 
 For each keyword in `SEARCH_KEYWORDS` it will:
 
-1. Search on the Naukri homepage (keywords + experience + optional location).
-2. Apply the `Freshness` filter and sort by `Date` (configurable via `.env`).
-3. Open each job's detail page:
+1. Navigate **directly** to Naukri's search-results URL for that keyword
+   (e.g. `https://www.naukri.com/node-dot-js-jobs?k=node.js&experience=5`)
+   — the same URL Naukri itself lands on after a manual search. This is far
+   more reliable than driving the homepage's animated, click-to-expand
+   search widget.
+2. Open each job's detail page:
    - **"Apply on company site"** → skipped (external redirect) and logged.
    - **"Apply"** → clicked; any screening-question widget is answered via
      the Q&A bank / AI fallback, then logged as applied.
    - Already-applied jobs are detected and skipped.
-4. Paginates through results (`Next`) up to `MAX_PAGES_PER_KEYWORD`.
-5. Stops at `MAX_APPLICATIONS_PER_RUN` / `MAX_APPLICATIONS_PER_KEYWORD`, with
+3. Paginates through results (`Next`) up to `MAX_PAGES_PER_KEYWORD`.
+4. Stops at `MAX_APPLICATIONS_PER_RUN` / `MAX_APPLICATIONS_PER_KEYWORD`, with
    randomized human-like delays and periodic longer breaks throughout.
+
+Note: `SEARCH_FRESHNESS` / `SEARCH_SORT_BY` in `.env` are currently unused —
+filters/sort are intentionally skipped for reliability (the UI widgets for
+these were the main source of flakiness). Only `SEARCH_KEYWORDS`,
+`SEARCH_EXPERIENCE_YEARS`, and `SEARCH_LOCATION` affect the search URL.
 
 If Naukri shows a security check/captcha, the run stops immediately so you
 can solve it manually.
