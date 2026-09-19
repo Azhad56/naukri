@@ -75,14 +75,15 @@ const KEYWORD_SELECTOR = [
   'input[placeholder*="skills / designations" i]',
 ].join(", ");
 const LOCATION_SELECTOR = 'input[placeholder="Enter location"], input[placeholder*="location" i]';
-// The collapsed nav search box is NOT an <input> — it's a
-// <span class="nI-gNb-sb__placeholder">Search jobs here</span> inside a
-// container with id="nI-gNb-searchbar" (confirmed via live DevTools
-// inspection). A generic input[placeholder=...] selector can never match
-// it, and a generic "Search" button-text selector risks clicking an
-// unrelated Search button elsewhere on the page instead.
+// The collapsed nav search box is NOT an <input>. The actual topmost
+// clickable element (confirmed via live DevTools inspection + Playwright's
+// own "intercepts pointer events" trace) is:
+//   <button class="nI-gNb-sb__expand" aria-label="Search jobs here">
+// which sits ON TOP OF the decorative <span class="nI-gNb-sb__placeholder">
+// — clicking the span times out because this button always intercepts the
+// click. Target the button directly.
 const COLLAPSED_SEARCH_SELECTOR =
-  '#nI-gNb-searchbar, .nI-gNb-sb-searchbar, span.nI-gNb-sb__placeholder, input[placeholder="Search jobs here"]';
+  'button.nI-gNb-sb__expand, button[aria-label="Search jobs here"], #nI-gNb-searchbar, span.nI-gNb-sb__placeholder';
 
 /** Fills the homepage search box, picks experience, and submits. */
 async function runSearch(page, keyword) {
@@ -100,14 +101,15 @@ async function runSearch(page, keyword) {
   if (!keywordInput) {
     const collapsedSearch = await firstVisible(page, COLLAPSED_SEARCH_SELECTOR);
     if (collapsedSearch) {
-      await humanClick(page, collapsedSearch);
-    } else {
-      // Fallback: some layouts expand the bar via a search icon/button
-      // instead of a text input.
-      const searchToggle = page.getByRole("button", { name: /search jobs here|^search$/i }).first();
-      if (await searchToggle.count().catch(() => 0)) {
-        await humanClick(page, searchToggle);
-      }
+      // A decorative element sits on top of this button during its own
+      // expand animation, which makes Playwright's normal actionability
+      // checks retry-and-timeout. force:true skips those checks and just
+      // dispatches the click — safe here since we know exactly what we're
+      // targeting (confirmed via DevTools).
+      await collapsedSearch.scrollIntoViewIfNeeded().catch(() => {});
+      await collapsedSearch.click({ force: true, timeout: 5000 }).catch(async () => {
+        await collapsedSearch.click().catch(() => {});
+      });
     }
     // Poll for the now-expanded, visible keyword input rather than a fixed
     // delay — the expand animation/render can take a variable amount of time.
@@ -131,14 +133,14 @@ async function runSearch(page, keyword) {
     try {
       const expControl = page.getByText("Select experience", { exact: false }).first();
       if (await expControl.count().catch(() => 0)) {
-        await humanClick(page, expControl);
+        await humanClick(page, expControl).catch(() => expControl.click({ force: true }).catch(() => {}));
         await humanDelay(400, 800);
         const label = /^\d+$/.test(CONFIG.search.experienceYears)
           ? `${CONFIG.search.experienceYears} year${CONFIG.search.experienceYears === "1" ? "" : "s"}`
           : CONFIG.search.experienceYears;
         const option = page.getByText(label, { exact: true }).first();
         if (await option.count().catch(() => 0)) {
-          await humanClick(page, option);
+          await humanClick(page, option).catch(() => option.click({ force: true }).catch(() => {}));
         } else {
           console.warn(`  [WARN] Experience option "${label}" not found — leaving default.`);
         }
@@ -170,27 +172,29 @@ async function runSearch(page, keyword) {
     throw new Error("Keyword field is empty right before clicking Search — aborting this keyword.");
   }
 
+  // Submit via Enter on the keyword field rather than hunting for the right
+  // "Search" button among several on the page (simpler and more reliable —
+  // this is how a real form submit works, and matches normal browser
+  // behavior for a search box like this).
   const urlBeforeSearch = page.url();
-  const searchBtn = (await firstVisible(page, 'button:has-text("Search")')) ||
-    page.getByRole("button", { name: /^search$/i }).first();
-  await humanClick(page, searchBtn);
+  await keywordInput.click({ force: true }).catch(() => {});
+  await page.keyboard.press("Enter").catch(() => {});
 
-  // Confirm the click actually navigated to results — if something (e.g. a
-  // leftover autocomplete dropdown) ate the click, retry via Enter instead
-  // of silently continuing on the homepage (which is what caused "No job
-  // cards found" for every keyword).
-  const navigated = await page
+  let navigated = await page
     .waitForFunction((prev) => location.href !== prev, urlBeforeSearch, { timeout: 8000 })
     .then(() => true)
     .catch(() => false);
 
   if (!navigated) {
-    console.warn("  [WARN] Search click didn't navigate — retrying with Enter key.");
-    await keywordInput.click({ force: true }).catch(() => {});
-    await page.keyboard.press("Enter").catch(() => {});
-    await page
+    console.warn("  [WARN] Enter didn't navigate — retrying by clicking the Search button.");
+    const searchBtn =
+      (await firstVisible(page, 'button:has-text("Search")')) ||
+      page.getByRole("button", { name: /^search$/i }).first();
+    await searchBtn.click({ force: true, timeout: 5000 }).catch(() => {});
+    navigated = await page
       .waitForFunction((prev) => location.href !== prev, urlBeforeSearch, { timeout: 8000 })
-      .catch(() => {});
+      .then(() => true)
+      .catch(() => false);
   }
 
   await page.waitForLoadState("domcontentloaded").catch(() => {});
