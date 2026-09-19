@@ -52,7 +52,7 @@ function pickOption(options, candidates) {
 
 /**
  * Soft Yes/No screening questions where answering "No" tanks shortlist odds.
- * Always Yes — includes relocate / reside / city / hybrid / WFH etc.
+ * Always Yes — relocate / reside / interview availability / comfortable / etc.
  */
 function isFavorableYesQuestion(q) {
   return (
@@ -62,6 +62,11 @@ function isFavorableYesQuestion(q) {
     /comfortable|would you be (able|willing)|are you (open|willing|ok|okay)/.test(q) ||
     /fine working|flexible (with|to)|able to work|willing to work/.test(q) ||
     /hybrid|work from (home|office)|wfh|remote/.test(q) ||
+    // Interview availability — e.g. "Should be available for F2F interview on Monday..."
+    /available for.*(interview|f2f|face.?to.?face|walk.?in)/.test(q) ||
+    /(f2f|face.?to.?face|walk.?in).*(interview|on )/.test(q) ||
+    /available.*(monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}(st|nd|rd|th)?)/.test(q) ||
+    /can you (attend|join|come|appear)/.test(q) ||
     /notice period.*(serve|serving|immediate)/.test(q) ||
     /authoriz|legally.*work|work.*(permit|visa|status)|background check|drug test|consent to/.test(q)
   );
