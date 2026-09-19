@@ -33,12 +33,50 @@ async function safeGoto(page, url, opts = {}) {
   }
 }
 
+/** Naukri's pages often have multiple DOM matches for the same placeholder
+ * (hidden duplicates for responsive breakpoints, animated expand/collapse
+ * states, etc). `.first()` picks whichever comes first in the DOM, which
+ * is not necessarily the one actually visible on screen — pick the first
+ * one that's really visible instead. */
+async function firstVisible(page, selector) {
+  const all = await page.locator(selector).all();
+  for (const el of all) {
+    if (await el.isVisible().catch(() => false)) return el;
+  }
+  return null;
+}
+
+/** Types into a field the human way, then verifies the value actually
+ * stuck (Naukri's animated/expanding widgets can eat keystrokes if focus
+ * shifts mid-type) — falls back to a direct `.fill()` if not. */
+async function typeAndVerify(page, locator, text) {
+  await humanType(page, locator, text);
+  await humanDelay(200, 400);
+  const value = await locator.inputValue().catch(() => "");
+  const firstWord = text.split(/[,\s]+/)[0];
+  if (!value || !value.toLowerCase().includes(firstWord.toLowerCase())) {
+    console.warn(`  [WARN] Field didn't retain typed text (got "${value}") — retrying with direct fill.`);
+    await locator.click({ force: true }).catch(() => {});
+    await locator.fill(text).catch(() => {});
+    await humanDelay(200, 400);
+  }
+}
+
 export async function detectSecurityCheckpoint(page) {
   const url = page.url();
   if (/captcha|blocked/i.test(url)) return true;
   const bodyText = await page.locator("body").innerText().catch(() => "");
   return /unusual activity|verify you.?re a human|security check|access denied/i.test(bodyText);
 }
+
+const KEYWORD_SELECTOR = [
+  'input[placeholder="Enter keyword / designation / companies"]',
+  'input[placeholder*="Enter keyword" i]',
+  'input[placeholder*="skills / designations" i]',
+].join(", ");
+const LOCATION_SELECTOR = 'input[placeholder="Enter location"], input[placeholder*="location" i]';
+const COLLAPSED_SEARCH_SELECTOR =
+  'input[placeholder="Search jobs here"], input[placeholder*="Search jobs" i]';
 
 /** Fills the homepage search box, picks experience, and submits. */
 async function runSearch(page, keyword) {
@@ -47,36 +85,39 @@ async function runSearch(page, keyword) {
 
   // On the logged-in homepage, the full keyword/experience/location search
   // bar starts collapsed into a small "Search jobs here" box in the top
-  // nav. Clicking it expands the real search fields — only then are they
-  // visible/fillable.
-  const keywordSelector = [
-    'input[placeholder="Enter keyword / designation / companies"]',
-    'input[placeholder*="Enter keyword" i]',
-    'input[placeholder*="skills / designations" i]',
-  ].join(", ");
+  // nav. Clicking it expands the real search fields inline on the page —
+  // only then are they visible/fillable. There can be multiple DOM matches
+  // for the same placeholder (hidden duplicates for other breakpoints), so
+  // always pick the one that's actually visible, not just DOM-first.
+  let keywordInput = await firstVisible(page, KEYWORD_SELECTOR);
 
-  let keywordInput = page.locator(keywordSelector).first();
-  if (!(await keywordInput.isVisible().catch(() => false))) {
-    const collapsedSearch = page
-      .locator('input[placeholder="Search jobs here"], input[placeholder*="Search jobs" i]')
-      .first();
-    if (await collapsedSearch.count().catch(() => 0)) {
+  if (!keywordInput) {
+    const collapsedSearch = await firstVisible(page, COLLAPSED_SEARCH_SELECTOR);
+    if (collapsedSearch) {
       await humanClick(page, collapsedSearch);
-      await humanDelay(500, 900);
     } else {
       // Fallback: some layouts expand the bar via a search icon/button
       // instead of a text input.
       const searchToggle = page.getByRole("button", { name: /search jobs here|^search$/i }).first();
       if (await searchToggle.count().catch(() => 0)) {
         await humanClick(page, searchToggle);
-        await humanDelay(500, 900);
       }
     }
-    keywordInput = page.locator(keywordSelector).first();
+    // Poll for the now-expanded, visible keyword input rather than a fixed
+    // delay — the expand animation/render can take a variable amount of time.
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline && !keywordInput) {
+      keywordInput = await firstVisible(page, KEYWORD_SELECTOR);
+      if (!keywordInput) await sleep(300);
+    }
   }
 
-  await keywordInput.waitFor({ timeout: 15000 });
-  await humanType(page, keywordInput, keyword);
+  if (!keywordInput) {
+    await debugScreenshot(page, "keyword-input-not-found");
+    throw new Error("Could not find/expand the keyword search field on the homepage.");
+  }
+
+  await typeAndVerify(page, keywordInput, keyword);
   await humanDelay(600, 1100);
   await page.keyboard.press("Escape").catch(() => {}); // close autocomplete dropdown
 
@@ -103,9 +144,9 @@ async function runSearch(page, keyword) {
 
   if (CONFIG.search.location) {
     try {
-      const locInput = page.locator('input[placeholder="Enter location"]').first();
-      if (await locInput.count().catch(() => 0)) {
-        await humanType(page, locInput, CONFIG.search.location);
+      const locInput = await firstVisible(page, LOCATION_SELECTOR);
+      if (locInput) {
+        await typeAndVerify(page, locInput, CONFIG.search.location);
         await humanDelay(400, 800);
         await page.keyboard.press("Escape").catch(() => {});
       }
@@ -114,8 +155,18 @@ async function runSearch(page, keyword) {
     }
   }
 
+  // Sanity check right before hitting Search — log what we're actually
+  // about to submit so a bad run is diagnosable from the console alone.
+  const typedKeyword = await keywordInput.inputValue().catch(() => "");
+  console.log(`  [SEARCH] Keyword field contains: "${typedKeyword}"`);
+  if (!typedKeyword.trim()) {
+    await debugScreenshot(page, "keyword-empty-before-search");
+    throw new Error("Keyword field is empty right before clicking Search — aborting this keyword.");
+  }
+
   const urlBeforeSearch = page.url();
-  const searchBtn = page.getByRole("button", { name: /search/i }).first();
+  const searchBtn = (await firstVisible(page, 'button:has-text("Search")')) ||
+    page.getByRole("button", { name: /^search$/i }).first();
   await humanClick(page, searchBtn);
 
   // Confirm the click actually navigated to results — if something (e.g. a
@@ -139,6 +190,11 @@ async function runSearch(page, keyword) {
   await page.waitForLoadState("domcontentloaded").catch(() => {});
   await humanDelay(2000, 3500);
   console.log(`  [SEARCH] Landed on: ${page.url()}`);
+
+  if (/mnjuser\/homepage/.test(page.url())) {
+    await debugScreenshot(page, "still-on-homepage-after-search");
+    throw new Error("Still on the homepage after clicking Search — see debug screenshot.");
+  }
 }
 
 /** Applies the Freshness filter and sorts by the configured order. Best-effort. */
@@ -279,7 +335,13 @@ async function processJob(page, card, jobContext) {
 
 async function processKeyword(page, keyword, state) {
   console.log(`\n=== Keyword: "${keyword}" ===`);
-  await runSearch(page, keyword);
+  try {
+    await runSearch(page, keyword);
+  } catch (err) {
+    if (err.message === "SECURITY_CHECKPOINT_DETECTED") throw err;
+    console.error(`  [SKIP KEYWORD] Search failed for "${keyword}": ${err.message}`);
+    return;
+  }
   await applyFiltersAndSort(page);
 
   let handledForKeyword = 0;
