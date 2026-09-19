@@ -1,25 +1,20 @@
 /**
- * Handles Naukri's optional post-"Apply" screening questions.
+ * Handles Naukri's optional post-"Apply" screening-question chatbot.
  *
- * For many jobs, clicking "Apply" instantly shows an "Applied to X"
- * confirmation with no further input. For others, Naukri shows a
- * chatbot-style "quick questions" widget (radio choices, dropdowns, or
- * free-text) before the application is actually submitted.
+ * Typical UI (confirmed from live screenshots):
+ *  - A chat bubble with the question text ending in "?"
+ *  - Radio options: Yes / No / Skip this question
+ *  - A "Save" button at the bottom
  *
- * IMPORTANT: the recorded walkthrough this automation was built from never
- * triggered this widget, so the selectors below are written defensively —
- * broad, role/text-based, and generic — rather than tied to exact class
- * names. If Naukri shows a question flow with different markup on your
- * account, watch the console output (`[CHATBOT] ...` lines) on the first
- * real run and tighten these selectors as needed.
+ * Soft screening questions (relocate / reside / comfortable / willing) always
+ * get Yes to maximize shortlist probability.
  */
 import { CONFIG } from "./config.js";
 import { matchKnownAnswer, SKIP } from "./qaBank.js";
 import { resolveWithAI } from "./aiFallback.js";
-import { humanClick, humanType, humanDelay, sleep } from "./humanize.js";
+import { humanClick, humanDelay, sleep } from "./humanize.js";
 import { logAnswer } from "./logger.js";
 
-/** Generic locator for any question/chat widget Naukri might overlay after Apply. */
 function widgetLocator(page) {
   return page
     .locator(
@@ -28,6 +23,7 @@ function widgetLocator(page) {
         '[class*="chatbot" i]',
         '[class*="chat-bot" i]',
         '[id*="chatbot" i]',
+        '[class*="bot" i]:has-text("Save")',
         '[class*="drawer" i]:has(input), [class*="drawer" i]:has(select)',
       ].join(", ")
     )
@@ -36,130 +32,141 @@ function widgetLocator(page) {
 }
 
 async function isWidgetOpen(page) {
+  // Prefer detecting by the Save button that appears in the chatbot footer —
+  // more reliable than dialog roles alone.
+  const saveBtn = page.getByRole("button", { name: /^save$/i });
+  if ((await saveBtn.count().catch(() => 0)) && (await saveBtn.last().isVisible().catch(() => false))) {
+    // Make sure it's the chatbot save, not the job-detail "Save" bookmark.
+    const nearbyQuestion = page.locator("text=/\\?$/").last();
+    if (await nearbyQuestion.isVisible().catch(() => false)) return true;
+  }
   const widget = widgetLocator(page);
   return (await widget.count().catch(() => 0)) > 0 && (await widget.isVisible().catch(() => false));
 }
 
-async function labelForField(container, input) {
-  const id = await input.getAttribute("id").catch(() => null);
-  if (id) {
-    const byFor = container.locator(`xpath=.//label[@for="${id}"]`);
-    if (await byFor.count()) return (await byFor.first().innerText().catch(() => "")).trim();
+/** Pulls the latest chat-bubble question (text ending with "?"). */
+async function readLatestQuestion(page) {
+  const candidates = page.locator(
+    'div[role="dialog"] *, [class*="chat" i] *, [class*="bot" i] *'
+  );
+  const texts = await candidates.allInnerTexts().catch(() => []);
+  const questions = texts
+    .map((t) => t.replace(/\s+/g, " ").trim())
+    .filter((t) => t.length > 10 && t.length < 400 && /\?$/.test(t) && !/^yes$|^no$/i.test(t));
+  // Prefer the longest match that looks like a full sentence question
+  if (!questions.length) {
+    // Broader fallback: any visible "?" text on the page near Save
+    const broader = await page.locator("body").innerText().catch(() => "");
+    const m = broader.match(/([^\n?]{15,300}\?)/g);
+    if (m?.length) return m[m.length - 1].trim();
+    return "";
   }
-  const wrappingLabel = input.locator("xpath=ancestor::label[1]");
-  if (await wrappingLabel.count()) {
-    return (await wrappingLabel.first().innerText().catch(() => "")).trim();
-  }
-  // Fall back to the nearest preceding heading/question text block.
-  const nearbyQuestion = container
-    .locator("xpath=.//*[self::p or self::div or self::span or self::h3 or self::label]")
-    .filter({ hasText: /\?|select|choose|enter/i });
-  if (await nearbyQuestion.count()) {
-    return (await nearbyQuestion.last().innerText().catch(() => "")).trim();
-  }
-  return "";
+  return questions[questions.length - 1];
 }
 
-async function collectFields(widget) {
-  const fields = [];
-
-  const radioGroups = new Map();
-  for (const radio of await widget.locator('input[type="radio"]').all()) {
-    const name = (await radio.getAttribute("name").catch(() => null)) || "group";
-    if (!radioGroups.has(name)) radioGroups.set(name, []);
-    const label = await labelForField(widget, radio);
-    radioGroups.get(name).push({ locator: radio, label });
-  }
-  for (const [name, options] of radioGroups) {
-    if (!options.length) continue;
-    fields.push({ type: "radio", question: options[0].label || name, options });
-  }
-
-  for (const select of await widget.locator("select").all()) {
-    const label = await labelForField(widget, select);
-    const options = (await select.locator("option").allInnerTexts()).map((o) => o.trim());
-    fields.push({ type: "select", question: label, options, input: select });
-  }
-
-  for (const textInput of await widget
-    .locator('input[type="text"], input[type="number"], input[type="tel"], textarea')
-    .all()) {
-    const label = await labelForField(widget, textInput);
-    if (!label) continue;
-    fields.push({ type: "text", question: label, input: textInput });
-  }
-
-  return fields;
-}
-
-async function answerField(page, field, jobContext) {
-  let answer = matchKnownAnswer(field.question, field);
-  let source = "qa-bank";
-
-  if (answer === SKIP) {
-    logAnswer(jobContext, field.question, "(left as-is)", "skip");
+/**
+ * Clicks a Yes/No style option by visible text. Naukri's chatbot often uses
+ * custom radio markup (label/div) rather than bare <input type="radio">.
+ */
+async function clickOptionByText(page, label) {
+  const scope = page.locator('div[role="dialog"], [class*="chat" i], [class*="bot" i]').last();
+  const byRole = scope.getByRole("radio", { name: new RegExp(`^${label}$`, "i") });
+  if (await byRole.count().catch(() => 0)) {
+    await humanClick(page, byRole.first()).catch(() => byRole.first().click({ force: true }));
     return true;
   }
+  const byLabel = scope.locator(`label:has-text("${label}"), span:has-text("${label}"), div:has-text("${label}")`)
+    .filter({ hasText: new RegExp(`^\\s*${label}\\s*$`, "i") });
+  if (await byLabel.count().catch(() => 0)) {
+    await humanClick(page, byLabel.first()).catch(() => byLabel.first().click({ force: true }));
+    return true;
+  }
+  // Absolute last resort: page-level exact text
+  const exact = page.getByText(label, { exact: true }).last();
+  if (await exact.isVisible().catch(() => false)) {
+    await humanClick(page, exact).catch(() => exact.click({ force: true }));
+    return true;
+  }
+  return false;
+}
+
+async function clickSave(page) {
+  const saveBtn = page.getByRole("button", { name: /^save$/i }).last();
+  if (await saveBtn.count().catch(() => 0)) {
+    await humanClick(page, saveBtn).catch(() => saveBtn.click({ force: true }));
+    await humanDelay(800, 1600);
+    return true;
+  }
+  return false;
+}
+
+async function answerYesNoChat(page, jobContext) {
+  const question = await readLatestQuestion(page);
+  if (!question) return false;
+
+  // Always Yes for soft screening (relocate / reside / comfortable / etc.)
+  // and for any Yes/No chatbot question by default — "No" tanks shortlist odds.
+  let answer = matchKnownAnswer(question, { type: "radio", options: ["Yes", "No"] });
+  let source = "qa-bank";
+
+  if (answer === SKIP) return true;
 
   if (answer == null) {
-    const ai = await resolveWithAI(field.question, field, jobContext);
-    if (!ai) {
-      console.log(`    [CHATBOT][UNRESOLVED] "${field.question}" — logged for manual review`);
-      return false;
-    }
-    answer = ai.answer;
-    source = ai.source;
-  }
-
-  logAnswer(jobContext, field.question, answer, source);
-
-  switch (field.type) {
-    case "text": {
-      await humanType(page, field.input, answer);
-      break;
-    }
-    case "select": {
-      const ok = await field.input
-        .selectOption({ label: answer })
-        .then(() => true)
-        .catch(() => false);
-      if (!ok) await field.input.selectOption(answer).catch(() => {});
-      break;
-    }
-    case "radio": {
-      const opt =
-        field.options.find((o) => o.label.toLowerCase() === String(answer).toLowerCase()) ||
-        field.options.find((o) => o.label.toLowerCase().includes(String(answer).toLowerCase()));
-      if (opt) await humanClick(page, opt.locator);
-      break;
+    // Default Yes for any chatbot Yes/No question rather than risking "No" from AI
+    const hasYes = await page.getByText("Yes", { exact: true }).count().catch(() => 0);
+    const hasNo = await page.getByText("No", { exact: true }).count().catch(() => 0);
+    if (hasYes && hasNo) {
+      answer = "Yes";
+      source = "default-yes";
+    } else {
+      const ai = await resolveWithAI(question, { type: "radio", options: ["Yes", "No"] }, jobContext);
+      if (!ai) return false;
+      answer = ai.answer;
+      source = ai.source;
+      // Force Yes if AI returned No on a soft screening question
+      if (/^no$/i.test(String(answer)) && /relocat|resid|willing|comfortable|open to/i.test(question)) {
+        answer = "Yes";
+        source = "forced-yes";
+      }
     }
   }
 
+  // Never pick "Skip this question" or "No" when Yes is available for soft Qs
+  if (/^no$/i.test(String(answer)) || /skip/i.test(String(answer))) {
+    if (/relocat|resid|willing|comfortable|open to|hybrid|remote|wfh/i.test(question)) {
+      answer = "Yes";
+      source = "forced-yes";
+    }
+  }
+
+  logAnswer(jobContext, question, answer, source);
+  const clicked = await clickOptionByText(page, String(answer));
+  if (!clicked && /^yes$/i.test(String(answer))) {
+    // Try clicking the radio input next to Yes text
+    await clickOptionByText(page, "Yes");
+  }
   await humanDelay(
     CONFIG.limits.minDelayBetweenFormStepsMs,
     CONFIG.limits.maxDelayBetweenFormStepsMs
   );
+  await clickSave(page);
   return true;
 }
 
 /**
- * If Naukri shows a screening-question widget after Apply, answers it and
- * submits. No-ops (returns immediately) if no widget appears within the
- * short poll window — the normal "instant apply" path.
- *
  * @returns {"none"|"completed"|"needs_review"}
  */
 export async function handleScreeningQuestionsIfAny(page, jobContext) {
-  const pollDeadline = Date.now() + 4000;
-  let widget = null;
+  const pollDeadline = Date.now() + 5000;
+  let seen = false;
   while (Date.now() < pollDeadline) {
     if (await isWidgetOpen(page)) {
-      widget = widgetLocator(page);
+      seen = true;
       break;
     }
     await sleep(300);
   }
-  if (!widget) return "none";
+  if (!seen) return "none";
 
   console.log("  [CHATBOT] Screening question widget detected — answering...");
 
@@ -167,29 +174,16 @@ export async function handleScreeningQuestionsIfAny(page, jobContext) {
   for (let step = 0; step < MAX_STEPS; step++) {
     if (!(await isWidgetOpen(page))) return "completed";
 
-    const fields = await collectFields(widget);
-    let anyUnresolved = false;
-    for (const field of fields) {
-      const ok = await answerField(page, field, jobContext);
-      if (!ok) anyUnresolved = true;
-    }
-
-    if (anyUnresolved) {
-      console.log("  [CHATBOT] Unresolved question(s) — leaving for manual review.");
+    // Primary path: Naukri Yes/No chatbot (relocate / reside / etc.)
+    const ok = await answerYesNoChat(page, jobContext);
+    if (!ok) {
+      console.log("  [CHATBOT] Could not answer confidently — leaving for manual review.");
       return "needs_review";
     }
 
-    const advanceBtn = widget
-      .getByRole("button", { name: /^(submit|send|save|next|apply|done)$/i })
-      .first();
-    if (await advanceBtn.count().catch(() => 0)) {
-      await humanClick(page, advanceBtn);
-      await humanDelay(800, 1600);
-      continue;
-    }
-
-    // No obvious "next" control and nothing left to answer — assume done.
-    return "completed";
+    await humanDelay(600, 1200);
+    // If another question appears, loop; otherwise done
+    if (!(await isWidgetOpen(page))) return "completed";
   }
 
   console.log("  [CHATBOT] Exceeded max steps — leaving for manual review.");
