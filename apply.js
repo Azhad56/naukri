@@ -75,8 +75,14 @@ const KEYWORD_SELECTOR = [
   'input[placeholder*="skills / designations" i]',
 ].join(", ");
 const LOCATION_SELECTOR = 'input[placeholder="Enter location"], input[placeholder*="location" i]';
+// The collapsed nav search box is NOT an <input> — it's a
+// <span class="nI-gNb-sb__placeholder">Search jobs here</span> inside a
+// container with id="nI-gNb-searchbar" (confirmed via live DevTools
+// inspection). A generic input[placeholder=...] selector can never match
+// it, and a generic "Search" button-text selector risks clicking an
+// unrelated Search button elsewhere on the page instead.
 const COLLAPSED_SEARCH_SELECTOR =
-  'input[placeholder="Search jobs here"], input[placeholder*="Search jobs" i]';
+  '#nI-gNb-searchbar, .nI-gNb-sb-searchbar, span.nI-gNb-sb__placeholder, input[placeholder="Search jobs here"]';
 
 /** Fills the homepage search box, picks experience, and submits. */
 async function runSearch(page, keyword) {
