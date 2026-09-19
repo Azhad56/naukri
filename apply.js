@@ -167,6 +167,11 @@ async function processJob(page, card, jobContext) {
   await humanDelay(1000, 2000);
 
   const screeningResult = await handleScreeningQuestionsIfAny(page, jobContext);
+  if (screeningResult === "needs_review") {
+    logResult({ ...jobContext, status: "needs_review", reason: "chatbot_unresolved" });
+    console.log(`[NEEDS_REVIEW] ${jobContext.title} — screening question not answered`);
+    return "skipped";
+  }
 
   logResult({ ...jobContext, status: "applied", screening: screeningResult });
   console.log(`[APPLIED] ${jobContext.title}${screeningResult === "completed" ? " (answered screening questions)" : ""}`);
