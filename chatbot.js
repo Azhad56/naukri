@@ -1,305 +1,324 @@
-/**
- * Handles Naukri's post-Apply screening chatbot.
- *
- * Two common variants (confirmed from live screenshots/recordings):
- *  A) Yes / No / Skip this question   (relocate / reside / interview availability)
- *  B) Free-text chat questions        ("What is your current CTC...",
- *     "How many years of experience do you have in X?") answered via a
- *     "Type message here..." input, one question at a time, each confirmed
- *     with a "Save" button.
- *
- * Soft Yes/No screening questions ALWAYS get Yes → higher shortlist odds.
- * Free-text questions are answered from the resume-based Q&A bank, with the
- * local AI model as fallback for anything qaBank.js doesn't recognize.
- */
+﻿/** Handles the optional post-Apply screening drawer. */
 import fs from "node:fs";
 import path from "node:path";
 import { CONFIG } from "./config.js";
-import { matchKnownAnswer } from "./qaBank.js";
+import { matchKnownAnswer, SKIP } from "./qaBank.js";
 import { resolveWithAI } from "./aiFallback.js";
-import { humanClick, humanType, humanDelay, sleep } from "./humanize.js";
+import { humanDelay, sleep } from "./humanize.js";
 import { logAnswer } from "./logger.js";
+import { cardPrefix } from "./pagination.js";
 
-// Naukri's chat input isn't always a plain <input placeholder="Type message
-// here...">  — cast a wide net (contenteditable divs, textareas, generic
-// text inputs) so we don't silently mis-classify a text question as a
-// Yes/No one just because the placeholder wording/markup differs.
-const TEXT_INPUT_SELECTOR = [
-  'input[placeholder*="type message" i]',
-  'textarea[placeholder*="type message" i]',
-  'input[placeholder*="type your" i]',
-  'textarea[placeholder*="type your" i]',
-  'input[placeholder*="enter your" i]',
-  'textarea[placeholder*="enter your" i]',
-  '[contenteditable="true"]',
-  'input[type="text"]',
-  "textarea",
-].join(", ");
+const INPUTS = 'input:not([type]), input[type="text"], input[type="number"], input[type="email"], input[type="tel"], textarea, [contenteditable="true"]';
+const CHAT_ANCHORS = '[placeholder*="type message" i], [placeholder*="type your" i], [placeholder*="enter your" i]';
 
-async function chatDebugScreenshot(page, tag) {
-  try {
-    const dir = path.join(CONFIG.profileDir, "..", "debug");
-    fs.mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, `${Date.now()}-chatbot-${tag}.png`);
-    await page.screenshot({ path: file, fullPage: true });
-    console.log(`  [CHATBOT] Saved screenshot: ${file}`);
-  } catch {
-    // best-effort only
+async function visibleLast(locator) {
+  for (let i = await locator.count() - 1; i >= 0; i--) {
+    if (await locator.nth(i).isVisible()) return locator.nth(i);
   }
+  return null;
 }
 
-/**
- * The chatbot panel: any container with a visible "Save" button — covers
- * both the Yes/No variant and the free-text chat variant.
- */
-function chatPanel(page) {
-  return page
-    .locator("div, section, aside")
-    .filter({ has: page.getByRole("button", { name: /^save$/i }) })
-    .last();
+async function saveControl(panel) {
+  // Naukri may render Save as a styled element instead of a native button.
+  return await visibleLast(panel.getByRole("button", { name: /^save$/i })) ||
+    await visibleLast(panel.getByText(/^save$/i));
 }
 
-/** Finds the topmost visible panel with a Save button that looks like an
- * actual open question (Yes/No or free-text), returning both the panel and
- * a short diagnostic reason string for logging. */
-async function findQuestionPanel(page) {
-  const panels = page.locator("div, section, aside").filter({
-    has: page.getByRole("button", { name: /^save$/i }),
-  });
-  const n = await panels.count().catch(() => 0);
-  for (let i = n - 1; i >= 0; i--) {
-    const p = panels.nth(i);
-    if (!(await p.isVisible().catch(() => false))) continue;
-    const text = (await p.innerText().catch(() => "")).toLowerCase();
-    const hasQuestion =
-      /\?/.test(text) ||
-      /skip this question/i.test(text) ||
-      /relocat|resid|interview|available|f2f|willing|comfortable/i.test(text);
-    const hasYesNo = /\byes\b/.test(text) && /\bno\b/.test(text);
-    const hasTextInput = await findAnswerInput(p);
-    if ((hasYesNo || hasTextInput) && hasQuestion) {
-      return { panel: p, hasYesNo, hasTextInput: !!hasTextInput };
+export async function findQuestionPanel(page) {
+  for (const frame of page.frames()) {
+    const anchors = frame.locator(CHAT_ANCHORS).or(frame.getByText(/^skip this question$/i));
+    for (let i = await anchors.count() - 1; i >= 0; i--) {
+      const anchor = anchors.nth(i);
+      if (!await anchor.isVisible()) continue;
+      const ancestors = anchor.locator('xpath=ancestor::*[self::div or self::section or self::aside or self::form or @role="dialog"]');
+      for (let j = await ancestors.count() - 1; j >= 0; j--) {
+        const panel = ancestors.nth(j);
+        if (await saveControl(panel)) return panel;
+      }
+    }
+    // Require both a question and a field in a bounded container. This avoids
+    // using the job page's bookmark Save and search box as screening controls.
+    const panels = frame.locator('[role="dialog"], aside, section, form, div').filter({ has: frame.getByText(/^save$/i) });
+    for (let i = await panels.count() - 1; i >= 0; i--) {
+      const panel = panels.nth(i);
+      if (!await panel.isVisible()) continue;
+      const text = await panel.innerText();
+      if (text.length > 3000 || !/\?/.test(text)) continue;
+      if (await visibleLast(panel.locator(`${INPUTS}, select, [role="radio"], input[type="radio"]`))) return panel;
     }
   }
   return null;
 }
 
-async function isChatOpen(page) {
-  return (await findQuestionPanel(page)) !== null;
+export async function applicationConfirmed(page) {
+  return !!await visibleLast(page.getByText(/^(?:applied|successfully applied|you have successfully applied(?:.*)?|application (?:submitted|sent)(?: successfully)?[.!]?)$/i));
 }
 
-async function getOpenPanel(page) {
-  const found = await findQuestionPanel(page);
-  return found ? found.panel : chatPanel(page);
-}
-
-/** In the free-text chat variant, several Q/A bubbles from earlier in the
- * conversation remain visible above the current one — grab the LAST
- * question-shaped sentence, since that's always the one still awaiting
- * an answer. */
 async function readQuestion(panel) {
-  const text = (await panel.innerText().catch(() => "")).replace(/[ \t]+/g, " ").trim();
-  const matches = [...text.matchAll(/([^?\n]{5,280}\?)/g)];
-  if (matches.length) return matches[matches.length - 1][1].trim();
-  return text.slice(-200);
+  const text = (await panel.innerText()).replace(/[ \t]+/g, " ").trim();
+  const questions = [...text.matchAll(/([^?\n]+\?)/g)];
+  if (questions.length) return questions.at(-1)[1].trim();
+  return text.split("\n").map(s => s.trim()).filter(s => s && !/^(save|skip this question|yes|no)$/i.test(s)).at(-1) || "";
 }
 
-/** Returns the visible chat text input for the free-text variant, or null
- * if this is a Yes/No (button/radio-based) question. Radio-button panels
- * never contain a free-text field, so bail out early for those. */
-async function findAnswerInput(panel) {
-  const hasRadio = await panel
-    .getByRole("radio")
-    .count()
-    .catch(() => 0);
-  if (hasRadio) return null;
-
-  const candidates = panel.locator(TEXT_INPUT_SELECTOR);
-  const n = await candidates.count().catch(() => 0);
-  for (let i = n - 1; i >= 0; i--) {
-    const el = candidates.nth(i);
-    if (await el.isVisible().catch(() => false)) return el;
+async function fieldFor(panel) {
+  // Hidden radios from earlier steps must not mask the current text field.
+  const input = await visibleLast(panel.locator(INPUTS));
+  if (input) return { type: await input.getAttribute("type") === "number" ? "number" : "text", locator: input };
+  const select = await visibleLast(panel.locator("select"));
+  if (select) return { type: "select", locator: select, options: await select.locator("option:not([disabled])").allTextContents() };
+  const radios = panel.getByRole("radio");
+  const options = [];
+  for (let i = 0; i < await radios.count(); i++) {
+    const radio = radios.nth(i);
+    if (!await radio.isVisible()) continue;
+    const label = await radio.evaluate(el => el.getAttribute("aria-label") ||
+      (el.getAttribute("aria-labelledby") || "").split(/\s+/).map(id => document.getElementById(id)?.textContent || "").join(" ").trim() ||
+      [...(el.labels || [])].map(l => l.textContent).join(" ") || el.textContent || el.value);
+    if (label?.trim()) options.push(label.trim());
   }
+  if (options.length) return { type: "radio", options };
+  if (await visibleLast(panel.getByText(/^yes$/i)) && await visibleLast(panel.getByText(/^no$/i))) return { type: "radio", options: ["Yes", "No"] };
   return null;
 }
 
-/** Reads back whatever text currently sits in the input/contenteditable so
- * we can confirm typing actually landed instead of silently no-oping. */
-async function readInputValue(el) {
-  return el
-    .evaluate((node) => {
-      if ("value" in node) return node.value;
-      return node.textContent;
-    })
-    .catch(() => null);
-}
-
-async function clickYes(page, panel) {
-  const radio = panel.getByRole("radio", { name: /^yes$/i });
-  if (await radio.count().catch(() => 0)) {
-    await radio.first().check({ force: true }).catch(async () => {
-      await humanClick(page, radio.first()).catch(() => radio.first().click({ force: true }));
-    });
-    return true;
+async function fillAnswer(panel, field, answer) {
+  if (field.type === "text" || field.type === "number") {
+    await field.locator.fill(answer, { timeout: 5000 });
+    const actual = await field.locator.evaluate(el => "value" in el ? el.value : el.textContent);
+    return actual?.trim() === answer.trim();
   }
-
-  const label = panel.locator("label").filter({ hasText: /^yes$/i });
-  if (await label.count().catch(() => 0)) {
-    await humanClick(page, label.first()).catch(() => label.first().click({ force: true }));
-    return true;
+  if (field.type === "select") {
+    await field.locator.selectOption({ label: answer }, { timeout: 5000 });
+    return (await field.locator.locator("option:checked").innerText()).trim() === answer;
   }
+  const radio = await visibleLast(panel.getByRole("radio", { name: answer, exact: true }));
+  if (radio) {
+    if (await radio.isChecked()) return true;
+    if (!await radio.isEnabled()) return false;
 
-  const rows = panel.locator("div, li, span, button").filter({ hasText: /^yes$/i });
-  const n = await rows.count().catch(() => 0);
-  for (let i = 0; i < n; i++) {
-    const row = rows.nth(i);
-    const t = (await row.innerText().catch(() => "")).trim();
-    if (/^yes$/i.test(t) && (await row.isVisible().catch(() => false))) {
-      await humanClick(page, row).catch(() => row.click({ force: true }));
-      return true;
+    // Styled radios can have a nonzero box (isVisible=true) while CSS puts
+    // the actual input outside the viewport. Click the visible label first.
+    const identity = await radio.evaluate(el => ({ id: el.id, name: el.name, value: el.value }));
+    const labels = panel.locator("label");
+    for (let i = 0; i < await labels.count(); i++) {
+      const label = labels.nth(i);
+      const associated = await label.evaluate((el, target) => {
+        const control = el.control;
+        return !!control && (target.id ? control.id === target.id :
+          control.name === target.name && control.value === target.value);
+      }, identity);
+      if (!associated || !await label.isVisible()) continue;
+      await label.click({ timeout: 1500 }).catch(() => {});
+      if (await radio.isChecked()) return true;
     }
+
+    // Some variants bind the click handler to an option row instead of a
+    // label. Clicking its text bubbles to that row; verify the actual input.
+    const option = await visibleLast(panel.getByText(answer, { exact: true }));
+    if (option) {
+      await option.click({ timeout: 1500 }).catch(() => {});
+      if (await radio.isChecked()) return true;
+    }
+
+    // Keep native radios working, but never force-click an offscreen input
+    // or claim that selecting its text necessarily selected the control.
+    await radio.check({ timeout: 1500 }).catch(() => {});
+    return await radio.isChecked();
   }
-
-  const exact = panel.getByText("Yes", { exact: true }).first();
-  if (await exact.count().catch(() => 0)) {
-    await exact.click({ force: true });
-    return true;
-  }
-  return false;
-}
-
-async function clickSave(page, panel) {
-  const saveBtn = panel.getByRole("button", { name: /^save$/i }).last();
-  if (!(await saveBtn.count().catch(() => 0))) return false;
-
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
-    const disabled = await saveBtn.isDisabled().catch(() => false);
-    const ariaDisabled = (await saveBtn.getAttribute("aria-disabled").catch(() => null)) === "true";
-    if (!disabled && !ariaDisabled) break;
-    await sleep(200);
-  }
-
-  // Take a little "breath" before saving — mirrors how a real person
-  // briefly pauses after typing/selecting an answer before confirming it.
-  await humanDelay(1000, 2000);
-
-  await humanClick(page, saveBtn).catch(() => saveBtn.click({ force: true }));
-  await humanDelay(800, 1600);
+  const option = await visibleLast(panel.getByText(answer, { exact: true }));
+  if (!option) return false;
+  await option.click({ timeout: 5000 });
   return true;
 }
 
-async function answerCurrentQuestion(page, jobContext) {
-  const panel = await getOpenPanel(page);
-  if (!(await panel.isVisible().catch(() => false))) return false;
-
-  const question = await readQuestion(panel);
-  const textInput = await findAnswerInput(panel);
-  console.log(`  [CHATBOT] Question: "${question}" (${textInput ? "free-text" : "yes/no"})`);
-
-  if (textInput) {
-    // Free-text chat question, e.g. "What is your current CTC and expected
-    // annual CTC in INR?" or "How many years of experience do you have in
-    // React?" — answered from the resume-based Q&A bank, falling back to
-    // the local AI model for anything qaBank.js doesn't recognize.
-    let answer = matchKnownAnswer(question, { type: "text" });
-    let source = "qa-bank";
-    if (answer == null) {
-      console.log("  [CHATBOT] qaBank has no rule for this question — trying AI fallback...");
-      const resolved = await resolveWithAI(question, { type: "text" }, jobContext);
-      if (!resolved) {
-        console.log("  [CHATBOT] No known/AI answer for free-text question — leaving for manual review.");
-        await chatDebugScreenshot(page, "unanswerable-text-question");
-        return false;
+async function collectScreeningDetails(page) {
+  const details = [];
+  for (const frame of page.frames()) {
+    const frameDetails = await frame.evaluate(() => {
+      const clean = value => (value || "").replace(/\s+/g, " ").trim();
+      const visible = element => {
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+      };
+      const roots = new Set();
+      for (const root of document.querySelectorAll('[role="dialog"], aside, form, section')) {
+        const text = clean(root.innerText);
+        if (visible(root) && text.length <= 5000 && (/\?/.test(text) || /skip this question/i.test(text))) roots.add(root);
       }
-      answer = resolved.answer;
-      source = resolved.source;
-    }
+      const controls = document.querySelectorAll('input, select, textarea, [contenteditable="true"], [role="radio"], [role="option"], button');
+      for (const control of controls) {
+        let root = control.closest('[role="dialog"], aside, form, section');
+        if (!root) {
+          root = control.parentElement;
+          while (root && root !== document.body) {
+            const text = clean(root.innerText);
+            if (text.length >= 10 && text.length <= 3000 && (/\?/.test(text) || /skip this question/i.test(text))) break;
+            root = root.parentElement;
+          }
+        }
+        if (root && root !== document.body && visible(root)) roots.add(root);
+      }
 
-    logAnswer(jobContext, question || "(chatbot question)", answer, source);
-    await humanType(page, textInput, String(answer));
+      return [...roots].map(root => {
+        const rawText = clean(root.innerText).slice(0, 3000);
+        const questions = [...rawText.matchAll(/([^?]{3,500}\?)/g)].map(match => clean(match[1]));
+        const question = questions.at(-1) || rawText.split(/\n/).map(clean).find(line =>
+          line.length > 4 && !/^(yes|no|save|submit|continue|next|skip this question)$/i.test(line)
+        ) || "(question text not identified)";
+        const options = [];
+        const controlTypes = new Set();
+        for (const element of root.querySelectorAll('input, select, textarea, [contenteditable="true"], [role="radio"], [role="option"], button')) {
+          const tag = element.tagName.toLowerCase();
+          const type = clean(element.getAttribute("type") || element.getAttribute("role") ||
+            (element.isContentEditable ? "contenteditable" : tag));
+          controlTypes.add(type);
+          if (tag === "select") {
+            for (const option of element.options) {
+              const value = clean(option.textContent);
+              if (value && !option.disabled && !/select (?:an )?option/i.test(value)) options.push(value);
+            }
+            continue;
+          }
+          if (type === "radio" || type === "checkbox" || type === "option") {
+            const value = clean(element.getAttribute("aria-label") ||
+              [...(element.labels || [])].map(label => label.textContent).join(" ") ||
+              element.textContent || element.getAttribute("value"));
+            if (value) options.push(value);
+            continue;
+          }
+          if (tag === "button") {
+            const value = clean(element.innerText || element.getAttribute("aria-label"));
+            if (value && !/^(save|submit|continue|next|back|close|apply|skip this question)$/i.test(value)) options.push(value);
+          }
+        }
+        return {
+          question,
+          options: [...new Set(options)],
+          controlTypes: [...controlTypes],
+          panelText: rawText,
+        };
+      });
+    }).catch(() => []);
+    details.push(...frameDetails);
+  }
+  return details.filter((detail, index, all) =>
+    index === all.findIndex(other => other.question === detail.question &&
+      JSON.stringify(other.options) === JSON.stringify(detail.options))
+  );
+}
 
-    // Confirm the text actually landed — some widgets need a real
-    // dispatched `input` event, which humanType provides via keyboard.type,
-    // but verify anyway so a silent failure doesn't get logged as "applied".
-    let landed = (await readInputValue(textInput)) || "";
-    if (!landed.trim()) {
-      console.log("  [CHATBOT] Typed text didn't register — retrying with locator.fill()...");
-      await textInput.fill(String(answer)).catch(() => {});
-      await sleep(300);
-      landed = (await readInputValue(textInput)) || "";
-    }
-    console.log(`  [CHATBOT] Input now contains: "${landed.trim()}"`);
-    if (!landed.trim()) {
-      console.log("  [CHATBOT] Could not get any text into the input — leaving for manual review.");
-      await chatDebugScreenshot(page, "text-input-empty-after-type");
-      return false;
+async function diagnostic(page, jobContext, reason) {
+  const prefix = cardPrefix(jobContext);
+  console.log(`${prefix}[CHATBOT] Needs review: ${reason}`);
+  const screeningDetails = await collectScreeningDetails(page);
+  if (screeningDetails.length) {
+    for (const [index, detail] of screeningDetails.entries()) {
+      console.log(`${prefix}[CHATBOT] Unresolved question ${index + 1}: "${detail.question}"`);
+      console.log(`${prefix}[CHATBOT] Available options ${index + 1}: ${detail.options.length ? JSON.stringify(detail.options) : "(none detected)"}`);
+      console.log(`${prefix}[CHATBOT] Detected controls ${index + 1}: ${detail.controlTypes.length ? detail.controlTypes.join(", ") : "(none detected)"}`);
     }
   } else {
-    // Yes/No screening question — soft bias toward "Yes" for shortlist odds.
-    let answer = matchKnownAnswer(question, { type: "radio", options: ["Yes", "No"] }) || "Yes";
-    if (/^no$/i.test(String(answer)) || /skip/i.test(String(answer))) answer = "Yes";
-
-    logAnswer(jobContext, question || "(chatbot question)", answer, "qa-bank-yes");
-
-    if (!(await clickYes(page, panel))) {
-      console.log("  [CHATBOT] Could not click Yes option");
-      await chatDebugScreenshot(page, "could-not-click-yes");
-      return false;
-    }
+    console.log(`${prefix}[CHATBOT] No question/options could be extracted from the current page.`);
   }
-
-  await humanDelay(
-    CONFIG.limits.minDelayBetweenFormStepsMs,
-    CONFIG.limits.maxDelayBetweenFormStepsMs
-  );
-
-  console.log("  [CHATBOT] Pausing briefly before Save...");
-  if (!(await clickSave(page, panel))) {
-    console.log("  [CHATBOT] Could not click Save");
-    await chatDebugScreenshot(page, "could-not-click-save");
-    return false;
-  }
-  console.log("  [CHATBOT] Save clicked.");
-  return true;
+  const dir = path.join(CONFIG.profileDir, "..", "debug");
+  fs.mkdirSync(dir, { recursive: true });
+  await page.screenshot({ path: path.join(dir, `${Date.now()}-chatbot-unresolved.png`), fullPage: true }).catch(() => {});
+  let entries = [];
+  if (fs.existsSync(CONFIG.files.reviewQueue)) entries = JSON.parse(fs.readFileSync(CONFIG.files.reviewQueue, "utf8"));
+  entries.push({
+    job: jobContext,
+    reason,
+    pageUrl: page.url(),
+    screeningDetails,
+    at: new Date().toISOString(),
+  });
+  fs.mkdirSync(path.dirname(CONFIG.files.reviewQueue), { recursive: true });
+  fs.writeFileSync(CONFIG.files.reviewQueue, JSON.stringify(entries, null, 2));
+  return "needs_review";
 }
 
-/**
- * @returns {"none"|"completed"|"needs_review"}
- */
-export async function handleScreeningQuestionsIfAny(page, jobContext) {
-  // Some popups take a moment to animate in after clicking Apply — give it
-  // a generous window before concluding there's no widget at all.
-  const pollDeadline = Date.now() + 8000;
-  let seen = false;
-  while (Date.now() < pollDeadline) {
-    if (await isChatOpen(page)) {
-      seen = true;
-      break;
+/** "none" means direct application confirmed; closing a drawer is not success. */
+export async function handleScreeningQuestionsIfAny(page, jobContext, options = {}) {
+  const prefix = cardPrefix(jobContext);
+  const timeoutMs = options.timeoutMs ?? 15000;
+  const pollMs = options.pollMs ?? 250;
+  const betweenQuestionMinMs = options.betweenQuestionMinMs ?? 1000;
+  const betweenQuestionMaxMs = options.betweenQuestionMaxMs ?? 3000;
+  const aiResolver = options.aiResolver ?? resolveWithAI;
+  let deadline = Date.now() + timeoutMs;
+  let pending = null;
+  let answered = 0;
+  try {
+    while (Date.now() < deadline) {
+      const panel = await findQuestionPanel(page);
+      if (!panel) {
+        if (await applicationConfirmed(page)) {
+          if (pending) logAnswer(jobContext, pending.question, pending.answer, pending.source, "saved");
+          return answered ? "completed" : "none";
+        }
+        await sleep(pollMs);
+        continue;
+      }
+      const question = await readQuestion(panel);
+      const field = await fieldFor(panel);
+      if (!question || !field) { await sleep(pollMs); continue; }
+      if (pending) {
+        if (question === pending.question) { await sleep(pollMs); continue; }
+        logAnswer(jobContext, pending.question, pending.answer, pending.source, "saved");
+        pending = null;
+        const breathSeconds = `${(betweenQuestionMinMs / 1000).toFixed(1)}-${(betweenQuestionMaxMs / 1000).toFixed(1)}`;
+        console.log(`${prefix}[CHATBOT] Taking a little breath before the next question (${breathSeconds}s)...`);
+        await humanDelay(betweenQuestionMinMs, betweenQuestionMaxMs);
+        // The drawer may rerender while waiting, so restart detection instead
+        // of answering through locators captured before the pause.
+        deadline = Date.now() + timeoutMs;
+        continue;
+      }
+      if (answered >= 30) return await diagnostic(page, jobContext, "Screening exceeded 30 questions");
+      console.log(`${prefix}[CHATBOT] Question: "${question}" (${field.type})`);
+      const descriptor = { type: field.type, options: field.options };
+      let answer = matchKnownAnswer(question, descriptor);
+      let source = "qa-bank";
+      if (answer === SKIP) {
+        answer = field.locator ? await field.locator.evaluate(el => "value" in el ? el.value : el.textContent) : null;
+        source = "prefilled";
+      }
+      if (answer == null || String(answer).trim() === "") {
+        console.log(`${prefix}[CHATBOT] Q&A bank has no grounded answer; trying OpenAI...`);
+        const resolved = await aiResolver(question, descriptor, jobContext);
+        if (!resolved?.answer) {
+          const reason = resolved?.error ? ` (${resolved.error})` : "";
+          return await diagnostic(page, jobContext, `No answer available: ${question}${reason}`);
+        }
+        ({ answer, source } = resolved);
+      }
+      answer = String(answer).trim();
+      if (field.options && !field.options.includes(answer)) return await diagnostic(page, jobContext, `Answer does not match available options: ${question}`);
+      if (!await fillAnswer(panel, field, answer)) return await diagnostic(page, jobContext, `Answer did not register: ${question}`);
+      logAnswer(jobContext, question, answer, source, "filled");
+      const save = await saveControl(panel);
+      if (!save) return await diagnostic(page, jobContext, `Save control missing: ${question}`);
+      const saveDeadline = Date.now() + Math.min(timeoutMs, 5000);
+      let enabled = false;
+      while (Date.now() < saveDeadline) {
+        enabled = await save.isEnabled() && await save.getAttribute("aria-disabled") !== "true" &&
+          !/(^|\s)disabled(\s|$)/i.test(await save.getAttribute("class") || "");
+        if (enabled) break;
+        await sleep(pollMs);
+      }
+      if (!enabled) return await diagnostic(page, jobContext, `Save stayed disabled: ${question}`);
+      pending = { question, answer, source };
+      await save.click({ timeout: 5000 });
+      answered++;
+      deadline = Date.now() + timeoutMs;
+      await sleep(pollMs);
     }
-    await sleep(300);
+    return await diagnostic(page, jobContext, pending ? `Saved answer did not advance: ${pending.question}` : "No application confirmation or supported question appeared");
+  } catch (error) {
+    return await diagnostic(page, jobContext, `Screening error: ${error.message}`);
   }
-  if (!seen) return "none";
-
-  console.log("  [CHATBOT] Screening question widget detected — answering...");
-  await chatDebugScreenshot(page, "widget-detected");
-
-  const MAX_STEPS = 10;
-  for (let step = 0; step < MAX_STEPS; step++) {
-    if (!(await isChatOpen(page))) return "completed";
-
-    const ok = await answerCurrentQuestion(page, jobContext);
-    if (!ok) {
-      console.log("  [CHATBOT] Failed to answer — leaving for manual review.");
-      return "needs_review";
-    }
-
-    await humanDelay(600, 1200);
-    if (!(await isChatOpen(page))) return "completed";
-  }
-
-  console.log("  [CHATBOT] Exceeded max steps — leaving for manual review.");
-  return "needs_review";
 }
 
 export default handleScreeningQuestionsIfAny;

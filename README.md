@@ -1,9 +1,9 @@
 # Naukri.com Auto Apply
 
 Standalone Playwright automation for Naukri.com. Uses your real Chrome
-profile (logged in once), human-like pacing, a resume-based Q&A bank for any
-screening questions, and optional local Ollama fallback for unknown
-questions.
+profile (logged in once), human-like pacing, a resume-based Q&A bank for
+screening questions, local Ollama job-match scoring, and an OpenAI fallback
+only for unknown screening questions.
 
 **Jobs whose CTA reads "Apply on company site" are always skipped** —
 this bot only applies to jobs with a direct Naukri "Apply" button.
@@ -18,8 +18,10 @@ cp .env.example .env
 ```
 
 Make sure [Ollama](https://ollama.com) is running with `llama3.2` if you want
-AI answers for unrecognized screening questions (local only, resume data
-never leaves your machine).
+AI-assisted job-match scoring. To answer screening questions that `qaBank.js`
+does not recognize, add a newly generated `OPENAI_API_KEY` to `.env`.
+Candidate facts and resume text are sent to OpenAI only for those unknown
+questions; Responses API storage is disabled.
 
 ## Login (once)
 
@@ -87,6 +89,7 @@ can solve it manually.
 | What | Where |
 |------|--------|
 | Email, phone, CTC, etc. | `.env` (gitignored) |
+| OpenAI API key | `OPENAI_API_KEY` in `.env` (gitignored) |
 | Naukri session | `data/chrome-profile/` (gitignored) |
 | Password | Never stored |
 
@@ -97,31 +100,47 @@ apply.js         main search + apply script
 login.js         one-time manual login
 config.js        loads .env + search/filter/limit settings
 qaBank.js        rule-based screening-question answers
-aiFallback.js    local Ollama fallback
+aiFallback.js    OpenAI fallback for unknown screening questions
 chatbot.js       handles Naukri's optional post-Apply question widget
 browser.js / humanize.js / logger.js / resumeText.js / loadEnv.js
 .env.example     template for secrets
 data/            runtime profile, logs, caches (gitignored)
 ```
 
-## Note on the screening-question widget
+## Screening questions and logs
 
-`chatbot.js` handles two confirmed variants of Naukri's post-Apply
-screening-question widget, answering one question at a time and clicking
-**Save** after each (with a short 1–2s "breath" pause before every Save,
-mirroring natural human pacing):
+After Apply, the bot waits for an application confirmation or a screening drawer.
+It supports text, numeric, contenteditable, radio, and native dropdown fields,
+using the Q&A bank first and OpenAI `gpt-6.1-sol` only when no grounded rule is
+available. It waits for Save to become enabled and for the next question before
+answering again. A missing or closed drawer alone does not count as a successful
+application.
 
-- **Yes/No questions** (relocate, residency, hybrid/WFH, interview
-  availability, notice period, work authorization, etc.) — these always
-  get **Yes**, since a "No" here is often an instant auto-reject and
-  answering Yes maximizes shortlist odds.
-- **Free-text chat questions** ("What is your current CTC and expected
-  annual CTC in INR?", "How many years of experience do you have in
-  React?", etc.) — answered from the resume-based Q&A bank (`qaBank.js`),
-  falling back to the local Ollama model (`aiFallback.js`) for anything
-  unrecognized, then typed character-by-character into the chat's
-  "Type message here..." box.
+Questions and answers appear in the terminal and data/questions-answers.json,
+with the job URL, source, timestamp, and status:
 
-Watch the console `[CHATBOT] ...` / `[Q&A:...]` output on your first real
-run and tighten the selectors in `chatbot.js` if your account sees a
-differently-structured widget.
+- filled: the answer was entered into the field.
+- saved: the next question or application confirmation appeared after Save.
+
+Unresolved questions are recorded in data/needs-review.json, with a screenshot
+in data/debug/. Application outcomes remain in data/applied-log.json.
+
+Keep candidate.skills in config.js accurate. Per the configured candidate rules,
+an unlisted skill uses `TOTAL_YEARS_EXPERIENCE`. Other unknown questions use
+OpenAI; if it cannot provide a grounded answer, the job needs manual review.
+Provider/model/context-scoped answers are cached in data/answers-cache.json.
+Token usage is recorded without prompts or resume content in
+data/openai-usage.json.
+
+Ollama remains responsible for optional job-match scoring. The OpenAI screening
+model never participates in match scoring. If `OPENAI_API_KEY` is missing, known
+questions and job matching continue, while unknown questions are sent to manual
+review.
+
+## Tests
+
+Run npm test (or npm.cmd test in PowerShell if script execution is disabled).
+Tests use headless Chrome and local HTML fixtures without logging in or sending
+real job applications. They cover field types, iframe drawers, delayed and
+multiple questions, Save failures, application confirmation, and Q&A persistence.
+OpenAI calls are mocked, so the test suite never needs a key or consumes credits.

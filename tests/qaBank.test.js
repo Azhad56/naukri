@@ -1,0 +1,83 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { CONFIG } from "../config.js";
+import { matchKnownAnswer } from "../qaBank.js";
+
+test("answers LWD and related joining-timeline questions from candidate guidance", async (t) => {
+  const textQuestions = [
+    "If yes, when is your LWD?",
+    "What is your last working day?",
+    "What is your last working date with your current employer?",
+    "What is your notice period?",
+    "How soon can you join?",
+    "When can you start?",
+  ];
+  for (const question of textQuestions) {
+    await t.test(question, () => {
+      assert.equal(matchKnownAnswer(question, { type: "text" }), "Immediate");
+    });
+  }
+  assert.equal(matchKnownAnswer("How many notice days do you have?", { type: "number" }), "0");
+  assert.equal(
+    matchKnownAnswer("Select your notice period", {
+      type: "select",
+      options: ["30 days", "Immediate", "60 days"],
+    }),
+    "Immediate"
+  );
+  assert.equal(
+    matchKnownAnswer("Are you available to join immediately?", {
+      type: "radio",
+      options: ["Yes", "No"],
+    }),
+    "Yes"
+  );
+});
+
+test("uses configured total experience for unlisted skills and related wording", () => {
+  const years = String(CONFIG.candidate.totalYearsExperience);
+  assert.equal(
+    matchKnownAnswer("How many years of experience do you have in PHP?", { type: "text" }),
+    years
+  );
+  assert.equal(
+    matchKnownAnswer("How many years of C++ experience do you have?", { type: "number" }),
+    years
+  );
+  assert.equal(
+    matchKnownAnswer("Select your years of Rust experience", {
+      type: "select",
+      options: ["0-2 years", "3-5 years", "6-8 years"],
+    }),
+    "3-5 years"
+  );
+});
+
+test("answers Yes for questions about AI coding-tool usage", () => {
+  const questions = [
+    "Have you used AI coding tools like GitHub Copilot, Claude Code, Cursor, Windsurf, or similar tools in your day-to-day development work?",
+    "Do you use AI developer tools?",
+    "Have you worked with Codeium or Tabnine?",
+  ];
+  for (const question of questions) {
+    assert.equal(matchKnownAnswer(question, { type: "text" }), "Yes");
+    assert.equal(
+      matchKnownAnswer(question, { type: "radio", options: ["Yes", "No"] }),
+      "Yes"
+    );
+  }
+});
+
+test("continues to answer Yes for relocation and residence variants", () => {
+  const questions = [
+    "Are you currently residing in Gurugram, Haryana or willing to relocate to Gurugram, Haryana?",
+    "Are you living or willing to relocation to Gurgaon/Gurugram?",
+    "Are you open to move to Noida?",
+  ];
+  for (const question of questions) {
+    assert.equal(
+      matchKnownAnswer(question, { type: "radio", options: ["Yes", "No"] }),
+      "Yes"
+    );
+  }
+});

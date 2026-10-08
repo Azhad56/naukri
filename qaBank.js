@@ -22,7 +22,7 @@ const SKILL_NAMES = Object.keys(c.skills).sort((a, b) => b.length - a.length);
 
 function findSkillInQuestion(q) {
   for (const skill of SKILL_NAMES) {
-    const re = new RegExp(`\\b${skill.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+    const re = new RegExp(`(?:^|[^a-z0-9])${skill.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=$|[^a-z0-9])`, "i");
     if (re.test(q)) return skill;
   }
   return null;
@@ -72,6 +72,44 @@ function isFavorableYesQuestion(q) {
   );
 }
 
+function isJoiningTimelineQuestion(q) {
+  return (
+    /\blwd\b/.test(q) ||
+    /last working (day|date)/.test(q) ||
+    /last (day|date) (at|of|with) (work|current|previous)/.test(q) ||
+    /notice period|notice days?/.test(q) ||
+    /how soon can you (join|start)/.test(q) ||
+    /when can you (join|start)/.test(q) ||
+    /joining availability|available to join/.test(q)
+  );
+}
+
+function answerJoiningTimeline(field, options) {
+  if (field.type === "number") return "0";
+  if (field.type === "radio" || field.type === "select") {
+    const immediate = pickOption(options, [
+      "Immediate",
+      "Immediately",
+      "0",
+      "0 days",
+      "0-15 days",
+      "0-30 days",
+      "Less than 30 days",
+      "Serving notice period",
+    ]);
+    if (immediate) return immediate;
+    if (options.some((option) => norm(option) === "yes")) return pickYesNo(options, true);
+  }
+  return "Immediate";
+}
+
+function isAICodingToolsQuestion(q) {
+  return (
+    /ai (coding|developer|development) tools?/.test(q) ||
+    /github copilot|claude code|cursor|windsurf|codeium|tabnine/.test(q)
+  );
+}
+
 /**
  * @param {string} questionText
  * @param {{type: string, options?: string[]}} field
@@ -87,6 +125,17 @@ export function matchKnownAnswer(questionText, field = {}) {
   if (/^email/.test(q) && !/other/.test(q)) return SKIP;
   if (/^(full )?name/.test(q)) return SKIP;
 
+  // Candidate guidance: LWD/last-working-date/notice-period questions mean
+  // immediate availability. Numeric fields receive zero days.
+  if (isJoiningTimelineQuestion(q)) {
+    return answerJoiningTimeline(field, options);
+  }
+
+  // Candidate guidance: confirm regular use of AI-assisted coding tools.
+  if (isAICodingToolsQuestion(q)) {
+    return isChoice ? pickYesNo(options, true) : "Yes";
+  }
+
   // Soft screening → always Yes (shortlist bias). Matches e.g.
   // "Are you currently residing in Hyderabad... or willing to relocate...?"
   if (isFavorableYesQuestion(q)) {
@@ -99,7 +148,10 @@ export function matchKnownAnswer(questionText, field = {}) {
       const years = c.skills[skill];
       return isChoice ? pickOption(options, [String(years), `${years}+`]) ?? String(years) : String(years);
     }
-    return String(c.totalYearsExperience);
+    // Candidate guidance: use total experience for technologies that are not
+    // individually listed in candidate.skills.
+    const years = String(c.totalYearsExperience);
+    return isChoice ? pickOption(options, [years, `${years}+`, `${years} years`]) ?? years : years;
   }
 
   if (/(level of education|bachelor|master|degree)/.test(q) && /(completed|have you|do you have)/.test(q)) {
@@ -108,24 +160,6 @@ export function matchKnownAnswer(questionText, field = {}) {
 
   if (/sponsor/.test(q)) {
     return pickYesNo(options, c.requiresSponsorship);
-  }
-
-  if (/notice period/.test(q)) {
-    if (isChoice && options.length) {
-      return (
-        pickOption(options, [
-          String(c.noticePeriodDays),
-          "Immediate",
-          "0-15 days",
-          "0-30 days",
-          "15 days",
-          "Less than 30 days",
-          "Immediately",
-          "Serving notice period",
-        ]) || options[0]
-      );
-    }
-    return String(c.noticePeriodDays);
   }
 
   // Combined free-text chat question, e.g.

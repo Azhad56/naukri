@@ -81,3 +81,31 @@ export async function humanScroll(page, locator) {
     // ignore
   }
 }
+
+/** Scrolls through a job page in viewport-sized steps so its description is
+ * visible long enough to be read before an application is submitted. */
+export async function humanReviewPage(page, options = {}) {
+  const minPauseMs = options.minPauseMs ?? 450;
+  const maxPauseMs = options.maxPauseMs ?? 900;
+  const maxSteps = options.maxSteps ?? 20;
+
+  for (let step = 0; step < maxSteps; step++) {
+    const metrics = await page.evaluate(() => ({
+      scrollY: window.scrollY,
+      viewportHeight: window.innerHeight,
+      scrollHeight: document.documentElement.scrollHeight,
+    })).catch(() => null);
+    if (!metrics) return;
+
+    const remaining = metrics.scrollHeight - metrics.viewportHeight - metrics.scrollY;
+    if (remaining <= 20) break;
+
+    const minStep = Math.max(180, Math.round(metrics.viewportHeight * 0.55));
+    const maxStep = Math.max(minStep, Math.round(metrics.viewportHeight * 0.8));
+    await page.mouse.wheel(0, Math.min(remaining, randInt(minStep, maxStep)));
+    await humanDelay(minPauseMs, maxPauseMs);
+  }
+
+  // Leave a short reading pause at the bottom before moving to Apply.
+  await humanDelay(minPauseMs, maxPauseMs);
+}

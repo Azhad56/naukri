@@ -12,7 +12,7 @@
  * "Apply on company site" are always skipped (external redirect, per your
  * requirement) — only jobs with a direct "Apply" button are applied to.
  * Any optional screening-question widget is answered via the resume-based
- * Q&A bank, with a local Ollama model as fallback for anything new.
+ * Q&A bank, with OpenAI as fallback only for unknown screening questions.
  *
  * Prerequisite: run `npm run login` once to save your session.
  * Run: npm start
@@ -21,10 +21,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { CONFIG } from "./config.js";
 import { launchBrowser, getOrCreatePage } from "./browser.js";
-import { humanClick, humanDelay, sleep } from "./humanize.js";
+import { humanClick, humanDelay, humanReviewPage, sleep } from "./humanize.js";
 import { handleScreeningQuestionsIfAny } from "./chatbot.js";
 import { extractJobDetails, computeMatchScore } from "./jobMatch.js";
 import { logResult, alreadyHandled } from "./logger.js";
+import { cardPrefix, findNextResultsUrl, jobUrlKey } from "./pagination.js";
 
 async function safeGoto(page, url, opts = {}) {
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -105,38 +106,20 @@ async function collectCards(page) {
   const cards = [];
   for (const a of anchors) {
     const href = await a.getAttribute("href").catch(() => null);
-    if (!href || seen.has(href)) continue;
+    const key = jobUrlKey(href, page.url());
+    if (!href || seen.has(key)) continue;
     const title = (await a.innerText().catch(() => "")).split("\n")[0].trim();
     if (!title) continue; // filters out non-title anchors that also match the href pattern
-    seen.add(href);
-    cards.push({ href, title });
+    seen.add(key);
+    cards.push({ href: new URL(href, page.url()).href, title, key });
   }
   return cards;
-}
-
-/** Clicks "Next" in the results pagination bar. Returns the new URL, or null if there's no next page. */
-async function goToNextResultsPage(page) {
-  const nextBtn = page
-    .locator('a, button, span')
-    .filter({ hasText: /^next$/i })
-    .last();
-  if (!(await nextBtn.count().catch(() => 0))) return null;
-
-  await nextBtn.scrollIntoViewIfNeeded().catch(() => {});
-  const disabled = await nextBtn
-    .evaluate((el) => el.classList.contains("disabled") || el.getAttribute("aria-disabled") === "true")
-    .catch(() => false);
-  if (disabled) return null;
-
-  await humanClick(page, nextBtn);
-  await page.waitForLoadState("domcontentloaded").catch(() => {});
-  await humanDelay(1800, 3200);
-  return page.url();
 }
 
 /** Visits a single job detail page and applies, skips, or handles screening questions.
  * @returns {"applied"|"skipped_company_site"|"skipped"|"failed"} */
 async function processJob(page, card, jobContext) {
+  const prefix = cardPrefix(jobContext);
   await safeGoto(page, card.href);
   await humanDelay(800, 1400);
 
@@ -144,21 +127,21 @@ async function processJob(page, card, jobContext) {
 
   const companySiteBtn = page.getByRole("button", { name: /apply on company site/i }).first();
   if (await companySiteBtn.count().catch(() => 0)) {
-    console.log(`[SKIP] ${jobContext.title} — requires "Apply on company site"`);
+    console.log(`${prefix}[SKIP] ${jobContext.title} — requires "Apply on company site"`);
     logResult({ ...jobContext, status: "skipped", reason: "apply_on_company_site" });
     return "skipped_company_site";
   }
 
   const alreadyAppliedBtn = page.getByText(/^applied$/i).first();
   if (await alreadyAppliedBtn.count().catch(() => 0)) {
-    console.log(`[SKIP] ${jobContext.title} — already applied previously`);
+    console.log(`${prefix}[SKIP] ${jobContext.title} — already applied previously`);
     logResult({ ...jobContext, status: "skipped", reason: "already_applied" });
     return "skipped";
   }
 
   const applyBtn = page.getByRole("button", { name: /^apply$/i }).first();
   if (!(await applyBtn.count().catch(() => 0))) {
-    console.log(`[SKIP] ${jobContext.title} — no direct Apply button found`);
+    console.log(`${prefix}[SKIP] ${jobContext.title} — no direct Apply button found`);
     logResult({ ...jobContext, status: "skipped", reason: "no_apply_button" });
     return "skipped";
   }
@@ -169,7 +152,7 @@ async function processJob(page, card, jobContext) {
   const jobDetails = await extractJobDetails(page);
   const match = await computeMatchScore(jobDetails, jobContext);
   console.log(
-    `  [MATCH] ${match.score}% (${match.source}${
+    `${prefix}[MATCH] ${match.score}% (${match.source}${
       match.aiScore != null ? `: keyword=${match.keywordScore}%, ai=${match.aiScore}%` : ""
     })${jobDetails.role ? ` — Role: ${jobDetails.role}` : ""}${
       jobDetails.keySkills.length ? ` — Key Skills: ${jobDetails.keySkills.slice(0, 8).join(", ")}` : ""
@@ -177,7 +160,7 @@ async function processJob(page, card, jobContext) {
   );
   if (match.score < CONFIG.matching.minMatchPercent) {
     console.log(
-      `[SKIP] ${jobContext.title} — match ${match.score}% below threshold ${CONFIG.matching.minMatchPercent}%`
+      `${prefix}[SKIP] ${jobContext.title} — match ${match.score}% below threshold ${CONFIG.matching.minMatchPercent}%`
     );
     logResult({
       ...jobContext,
@@ -189,19 +172,22 @@ async function processJob(page, card, jobContext) {
     return "skipped";
   }
 
-  console.log(`[OPEN] ${jobContext.title}`);
+  console.log(`${prefix}[REVIEW] Scrolling through the job description before applying...`);
+  await humanReviewPage(page);
+
+  console.log(`${prefix}[OPEN] ${jobContext.title}`);
   await humanClick(page, applyBtn);
   await humanDelay(1000, 2000);
 
   const screeningResult = await handleScreeningQuestionsIfAny(page, jobContext);
   if (screeningResult === "needs_review") {
     logResult({ ...jobContext, status: "needs_review", reason: "chatbot_unresolved" });
-    console.log(`[NEEDS_REVIEW] ${jobContext.title} — screening question not answered`);
+    console.log(`${prefix}[NEEDS_REVIEW] ${jobContext.title} — screening question not answered`);
     return "skipped";
   }
 
   logResult({ ...jobContext, status: "applied", screening: screeningResult });
-  console.log(`[APPLIED] ${jobContext.title}${screeningResult === "completed" ? " (answered screening questions)" : ""}`);
+  console.log(`${prefix}[APPLIED] ${jobContext.title}${screeningResult === "completed" ? " (answered screening questions)" : ""}`);
   return "applied";
 }
 
@@ -215,11 +201,10 @@ async function processKeyword(page, keyword, state) {
 
   if (await detectSecurityCheckpoint(page)) throw new Error("SECURITY_CHECKPOINT_DETECTED");
 
-  let handledForKeyword = 0;
+  let appliedForKeyword = 0;
   let pageNum = 1;
-
   while (
-    handledForKeyword < CONFIG.limits.maxApplicationsPerKeyword &&
+    appliedForKeyword < CONFIG.limits.maxApplicationsPerKeyword &&
     state.totalApplied < CONFIG.limits.maxApplicationsPerRun &&
     pageNum <= CONFIG.limits.maxPagesPerKeyword
   ) {
@@ -232,24 +217,38 @@ async function processKeyword(page, keyword, state) {
       break;
     }
 
-    // Capture the results URL now, while we're confidently on the results
-    // page, so we can return to it after visiting each job's detail page.
-    const resultsUrl = page.url();
+    console.log(`  [PAGE ${pageNum}] Found ${cards.length} job cards.`);
 
-    for (const card of cards) {
-      if (handledForKeyword >= CONFIG.limits.maxApplicationsPerKeyword) break;
+    // Capture pagination before visiting detail pages. Reloading the results
+    // page after every card can otherwise lose Naukri's client-side state.
+    const nextResultsUrl = await findNextResultsUrl(page);
+    let accountedFor = 0;
+
+    for (const [index, card] of cards.entries()) {
+      if (appliedForKeyword >= CONFIG.limits.maxApplicationsPerKeyword) break;
       if (state.totalApplied >= CONFIG.limits.maxApplicationsPerRun) break;
-      if (state.seenUrls.has(card.href) || alreadyHandled(card.href)) continue;
-      state.seenUrls.add(card.href);
+      const position = { pageNumber: pageNum, cardNumber: index + 1, cardsOnPage: cards.length };
+      const prefix = cardPrefix(position);
+      accountedFor += 1;
 
-      const jobContext = { jobUrl: card.href, title: card.title || "Untitled", keyword };
+      if (state.seenUrls.has(card.key)) {
+        console.log(`${prefix}[SKIP] ${card.title} — already processed under another keyword this run`);
+        continue;
+      }
+      state.seenUrls.add(card.key);
+      if (alreadyHandled(card.href)) {
+        console.log(`${prefix}[SKIP] ${card.title} — application already recorded`);
+        continue;
+      }
+
+      const jobContext = { jobUrl: card.href, title: card.title || "Untitled", keyword, ...position };
 
       let outcome = "failed";
       try {
         outcome = await processJob(page, card, jobContext);
       } catch (err) {
         if (err.message === "SECURITY_CHECKPOINT_DETECTED") throw err;
-        console.error(`[FAILED] ${jobContext.title}: ${err.message}`);
+        console.error(`${prefix}[FAILED] ${jobContext.title}: ${err.message}`);
         logResult({ ...jobContext, status: "failed", error: err.message });
         continue;
       }
@@ -258,8 +257,10 @@ async function processKeyword(page, keyword, state) {
       // burn the per-run application quota / long-break counter on skips.
       if (outcome === "skipped_company_site") continue;
 
-      handledForKeyword += 1;
-      if (outcome === "applied") state.totalApplied += 1;
+      if (outcome === "applied") {
+        appliedForKeyword += 1;
+        state.totalApplied += 1;
+      }
 
       if (outcome === "applied" && state.totalApplied > 0 && state.totalApplied % CONFIG.limits.longBreakEvery === 0) {
         const breakMs =
@@ -274,18 +275,21 @@ async function processKeyword(page, keyword, state) {
       // the long between-job delay — only real applications pace the run.
     }
 
-    console.log(`  -> processed page ${pageNum} (${cards.length} cards)`);
+    console.log(`  [PAGE ${pageNum}] Accounted for ${accountedFor}/${cards.length} cards.`);
 
-    // processJob() above navigated the page away to job detail URLs —
-    // return to the results listing before looking for pagination controls.
-    await safeGoto(page, resultsUrl);
-    await humanDelay(1000, 1800);
+    if (appliedForKeyword >= CONFIG.limits.maxApplicationsPerKeyword ||
+        state.totalApplied >= CONFIG.limits.maxApplicationsPerRun) {
+      console.log("Application limit reached; stopping pagination.");
+      break;
+    }
 
-    const nextUrl = await goToNextResultsPage(page);
-    if (!nextUrl) {
+    if (!nextResultsUrl) {
       console.log("No further result pages.");
       break;
     }
+    console.log(`  [PAGE ${pageNum}] Moving to page ${pageNum + 1}: ${nextResultsUrl}`);
+    await safeGoto(page, nextResultsUrl);
+    await humanDelay(1800, 3200);
     pageNum += 1;
   }
 
@@ -295,7 +299,9 @@ async function processKeyword(page, keyword, state) {
 async function main() {
   console.log("Starting Naukri automation...");
   console.log(
-    `Limits: ${CONFIG.limits.maxApplicationsPerRun}/run, ${CONFIG.limits.maxApplicationsPerKeyword}/keyword. AI fallback: ${CONFIG.ai.enabled ? CONFIG.ai.model : "disabled"}.`
+    `Limits: ${CONFIG.limits.maxApplicationsPerRun}/run, ${CONFIG.limits.maxApplicationsPerKeyword}/keyword. ` +
+    `Job matching: ${CONFIG.matching.useAI && CONFIG.ai.enabled ? `Ollama ${CONFIG.ai.model}` : "keyword-only"}. ` +
+    `Unknown screening answers: ${CONFIG.ai.enabled && CONFIG.openai.apiKey ? `OpenAI ${CONFIG.openai.answerModel}` : "manual review (OPENAI_API_KEY missing/AI disabled)"}.`
   );
 
   const context = await launchBrowser();
@@ -334,7 +340,7 @@ async function main() {
 
   console.log("\n========== SUMMARY ==========");
   console.log(`Total handled this run: ${state.totalApplied}`);
-  console.log("See ./data/applied-log.json and ./data/needs-review.json for full details.");
+  console.log("See ./data/applied-log.json, ./data/questions-answers.json and ./data/needs-review.json for full details.");
 
   await context.close();
 }

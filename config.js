@@ -46,7 +46,8 @@ export const CONFIG = {
     expectedCtcLpa: envInt("EXPECTED_CTC_LPA", 0),
     highestEducation: "Bachelor's Degree",
     educationCompleted: true,
-    // Optional: only needed for the local AI fallback's grounding context.
+    // Optional: used to ground Ollama job matching and OpenAI answers for
+    // screening questions the deterministic Q&A bank does not recognize.
     // Naukri applications reuse the resume already attached to your profile,
     // this automation never uploads a file during apply.
     resumePath: process.env.RESUME_PATH
@@ -123,6 +124,7 @@ export const CONFIG = {
   },
 
   ai: {
+    // Ollama remains the provider for frequent job-match scoring.
     enabled: envBool("AI_ENABLED", true),
     provider: "ollama",
     ollamaUrl: process.env.OLLAMA_URL || "http://localhost:11434/api/generate",
@@ -130,8 +132,19 @@ export const CONFIG = {
     autoAnswer: true,
   },
 
+  openai: {
+    // OpenAI is used only for unknown screening questions. A missing key is
+    // non-fatal: known answers and Ollama job scoring continue normally.
+    apiKey: process.env.OPENAI_API_KEY || "",
+    answerModel: process.env.OPENAI_ANSWER_MODEL || "gpt-6.1-sol",
+    reasoningEffort: "low",
+    timeoutMs: 60_000,
+  },
+
   files: {
+    qaLog: path.join(__dirname, "data", "questions-answers.json"),
     qaCache: path.join(__dirname, "data", "answers-cache.json"),
+    openaiUsage: path.join(__dirname, "data", "openai-usage.json"),
     appliedLog: path.join(__dirname, "data", "applied-log.json"),
     reviewQueue: path.join(__dirname, "data", "needs-review.json"),
     resumeText: path.join(__dirname, "data", "resume-text.json"),
