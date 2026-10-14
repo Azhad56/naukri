@@ -3,6 +3,30 @@ import assert from "node:assert/strict";
 import { CONFIG } from "../config.js";
 import { matchKnownAnswer } from "../qaBank.js";
 
+test('relocation selects every offered city but excludes skip and negative choices', () => {
+  assert.deepEqual(matchKnownAnswer('Please select the city you are currently residing or willing to relocate to', {
+    type: 'checkbox', options: ['Bengaluru', 'Kolkata', 'Skip this question', 'None of the above', 'Not willing to relocate'],
+  }), ['Bengaluru', 'Kolkata']);
+  assert.deepEqual(matchKnownAnswer('Choose your preferred work locations', {
+    type: 'checkbox', options: ['Kochi', 'All of the above'],
+  }), ['All of the above']);
+});
+
+test('single city choices respect the control and current residence stays factual', () => {
+  assert.equal(matchKnownAnswer('Select the city you are willing to relocate to', {
+    type: 'radio', options: ['Kochi', 'Kolkata'],
+  }), 'Kochi');
+  const original = CONFIG.candidate.location;
+  try {
+    CONFIG.candidate.location = 'Pune';
+    assert.deepEqual(matchKnownAnswer('Please select the city you are currently residing in', {
+      type: 'checkbox', options: ['Pune', 'Kolkata'],
+    }), ['Pune']);
+  } finally {
+    CONFIG.candidate.location = original;
+  }
+});
+
 test("answers LWD and related joining-timeline questions from candidate guidance", async (t) => {
   const textQuestions = [
     "If yes, when is your LWD?",

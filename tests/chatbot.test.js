@@ -229,3 +229,71 @@ test('unlisted skill answer is filled and saved without OpenAI', async () => {
   assert.equal(logs.at(-1).answer, String(CONFIG.candidate.totalYearsExperience));
   assert.equal(logs.at(-1).source, 'qa-bank');
 });
+
+const cityQuestion = 'Please select the city you are currently residing or willing to relocate to';
+function cityDrawer(cities, { history = '', skip = false, hidden = false } = {}) {
+  return `<aside>${history}<p>${cityQuestion}</p>${cities.map((city, i) =>
+    `<input ${hidden ? 'style="display:none"' : ''} id="city${i}" type="checkbox"><label for="city${i}">${city}</label>`).join('')}
+    ${skip ? '<label><input id="skip" type="checkbox" checked>Skip this question</label>' : ''}
+    <button id="save" disabled>Save</button></aside><script>(() => {
+    const cities = [...document.querySelectorAll('[id^="city"]')];
+    document.querySelector('aside').onchange = () => {
+      document.querySelector('#save').disabled = !cities.every(el => el.checked) || !!document.querySelector('#skip:checked');
+    };
+    document.querySelector('#save').onclick = () => {
+      window.selected = cities.filter(el => el.checked).map(el => el.labels[0].textContent);
+      document.body.innerHTML = '<p>Application submitted successfully</p>';
+    }; })();</script>`;
+}
+
+test('photo 1: selects Bengaluru and Kolkata after earlier answered questions, clears Skip', async () => {
+  await page.setContent(cityDrawer(['Bengaluru', 'Kolkata'], {
+    history: '<p>How many years of experience do you have in Dynamo Db?</p><div>5</div><p>How many years of experience do you have in Nodejs API development?</p><div>5</div>',
+    skip: true,
+  }));
+  assert.equal(await run({ aiResolver: async () => { throw new Error('Should use relocation preference'); } }), 'completed');
+  assert.deepEqual(await page.evaluate(() => window.selected), ['Bengaluru', 'Kolkata']);
+  const log = JSON.parse(fs.readFileSync(CONFIG.files.qaLog)).at(-1);
+  assert.equal(log.question, cityQuestion);
+  assert.deepEqual(log.answer, ['Bengaluru', 'Kolkata']);
+  assert.equal(log.status, 'saved');
+});
+
+test('photo 2: detects a checkbox-only prompt without question mark or Skip, including hidden inputs', async () => {
+  await page.setContent(cityDrawer(['Kochi', 'Thiruvananthapuram'], { hidden: true }));
+  assert.equal(await run(), 'completed');
+  assert.deepEqual(await page.evaluate(() => window.selected), ['Kochi', 'Thiruvananthapuram']);
+});
+
+test('already checked relocation city remains checked while remaining cities are selected', async () => {
+  await page.setContent(cityDrawer(['Pune', 'Indore']).replace('id="city0"', 'checked id="city0"'));
+  assert.equal(await run(), 'completed');
+  assert.deepEqual(await page.evaluate(() => window.selected), ['Pune', 'Indore']);
+});
+
+test('native multi-select selects every offered relocation city', async () => {
+  await page.setContent(drawer('<select multiple><option>Kochi</option><option>Kolkata</option></select>').replace(question, cityQuestion) + successScript);
+  assert.equal(await run(), 'completed');
+  assert.deepEqual(JSON.parse(fs.readFileSync(CONFIG.files.qaLog)).at(-1).answer, ['Kochi', 'Kolkata']);
+});
+
+test('unknown checkbox question uses and verifies multiple AI answers', async () => {
+  await page.setContent(cityDrawer(['Scrum', 'Kanban']).replace(cityQuestion, 'Select the development methods you use'));
+  let descriptor;
+  assert.equal(await run({ aiResolver: async (question, field) => {
+    descriptor = field;
+    return { answer: ['Scrum', 'Kanban'], source: 'openai' };
+  } }), 'completed');
+  assert.equal(descriptor.type, 'checkbox');
+  assert.deepEqual(descriptor.options, ['Scrum', 'Kanban']);
+});
+
+test('invalid deterministic choice falls through to AI instead of abandoning the application', async () => {
+  await page.setContent(drawer('<select><option>Three to five years</option><option>Six to ten years</option></select>') + successScript);
+  let calls = 0;
+  assert.equal(await run({ aiResolver: async () => {
+    calls++;
+    return { answer: 'Three to five years', source: 'openai' };
+  } }), 'completed');
+  assert.equal(calls, 1);
+});

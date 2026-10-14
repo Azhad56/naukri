@@ -110,11 +110,26 @@ data/            runtime profile, logs, caches (gitignored)
 ## Screening questions and logs
 
 After Apply, the bot waits for an application confirmation or a screening drawer.
-It supports text, numeric, contenteditable, radio, and native dropdown fields,
+It supports text, numeric, contenteditable, radio, checkbox, and native dropdown
+fields (including multi-select),
 using the Q&A bank first and OpenAI `gpt-6.1-sol` only when no grounded rule is
 available. It waits for Save to become enabled and for the next question before
 answering again. A missing or closed drawer alone does not count as a successful
 application.
+
+With `WILLING_TO_RELOCATE=true`, city questions about relocation select every
+offered city in checkbox/multi-select controls, or an explicit All option when
+available. Skip/None choices are excluded; single-choice controls select one
+acceptable location. Current-residence-only questions use the actual configured
+location. Prompts without question marks and prompts below earlier chat answers
+are supported, including styled checkboxes with hidden native inputs. Every
+selection is checked before Save, and already-selected cities remain selected.
+
+Unknown multi-choice questions can use multiple profile-grounded OpenAI answers.
+An incompatible rule-based choice falls through to OpenAI rather than immediately
+ending the application. Missing facts, unsupported controls, or failed Save still
+require review; the bot cannot guarantee every application completes. Review jobs
+are eligible for a later run because only confirmed applications are marked handled.
 
 Questions and answers appear in the terminal and data/questions-answers.json,
 with the job URL, source, timestamp, and status:

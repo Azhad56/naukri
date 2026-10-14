@@ -185,6 +185,20 @@ test("accepts an exact OpenAI answer for a screening dropdown", async () => {
   assert.equal(client.calls.length, 1);
 });
 
+test('multi-choice AI answers use an array schema, validate each option and survive caching', async () => {
+  const client = mockClient({ status: 'answered', answer: ['Scrum', 'Kanban'], confidence: 'high' });
+  const field = { type: 'checkbox', options: ['Scrum', 'Kanban', 'Waterfall'] };
+  const first = await resolveWithAI('Which methods do you use?', field, {}, dependencies(client));
+  assert.deepEqual(first.answer, ['Scrum', 'Kanban']);
+  assert.equal(client.calls[0].text.format.schema.properties.answer.type, 'array');
+  const cached = await resolveWithAI('Which methods do you use?', field, {}, dependencies(client));
+  assert.equal(cached.source, 'openai-cache');
+  assert.deepEqual(cached.answer, ['Scrum', 'Kanban']);
+  assert.equal(client.calls.length, 1);
+  const invalid = mockClient({ status: 'answered', answer: ['Scrum', 'Unknown'], confidence: 'high' });
+  assert.equal((await resolveWithAI('Which other methods?', field, {}, dependencies(invalid))).answer, null);
+});
+
 test("handles missing key, refusal-like output and API errors without exposing secrets", async (t) => {
   await t.test("missing key", async () => {
     const client = mockClient({ status: "answered", answer: "Yes", confidence: "high" });

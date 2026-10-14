@@ -18,6 +18,26 @@ function norm(s) {
   return (s || "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
+export function isNonAnswerOption(value) {
+  return /^(?:skip(?: this question)?|select (?:an? )?(?:option|city|location)|choose.*|none(?: of (?:these|the above))?|not (?:applicable|willing.*|open.*)|n\/?a|no|prefer not.*)$/i.test(norm(value));
+}
+
+function relocationAnswer(q, field, options) {
+  const relocation = /relocat|(?:open|willing|ready) to move/.test(q);
+  const locationChoice = /cit(?:y|ies)|locations?|places?/.test(q) &&
+    /prefer|willing|open|(?:work|job) locations?/.test(q);
+  if (!relocation && !locationChoice) return null;
+  const yesNo = options.some(option => /^yes$/i.test(option));
+  if (yesNo || !options.length) return pickYesNo(options, c.willingToRelocate);
+  if (!c.willingToRelocate) return null;
+  const choices = options.filter(option => !isNonAnswerOption(option));
+  const all = choices.find(option => /^(?:all(?: of the above| cities| locations)?|anywhere|any (?:city|location))$/i.test(option));
+  if (field.type === "checkbox" || field.type === "multiselect") {
+    return all ? [all] : choices.length ? choices : null;
+  }
+  return all || choices.find(option => norm(option) === norm(c.location)) || choices[0] || null;
+}
+
 const SKILL_NAMES = Object.keys(c.skills).sort((a, b) => b.length - a.length);
 
 function findSkillInQuestion(q) {
@@ -113,7 +133,7 @@ function isAICodingToolsQuestion(q) {
 /**
  * @param {string} questionText
  * @param {{type: string, options?: string[]}} field
- * @returns {string|null}
+ * @returns {string|string[]|null}
  */
 export function matchKnownAnswer(questionText, field = {}) {
   const q = norm(questionText);
@@ -121,6 +141,17 @@ export function matchKnownAnswer(questionText, field = {}) {
     (o) => o && !/select an option|skip this question/i.test(o)
   );
   const isChoice = field.type === "radio" || field.type === "select";
+
+  // The candidate is open to every offered relocation city. Preserve arrays
+  // for controls that allow multiple selections, including unfamiliar cities.
+  const relocation = relocationAnswer(q, field, options);
+  if (relocation != null) return relocation;
+
+  if (/current.*(?:city|location|resid)|where.*(?:live|reside|based)/.test(q) && !/relocat/.test(q)) {
+    if (!c.location) return null;
+    const residence = options.length ? pickOption(options, [c.location]) : c.location;
+    return residence && (field.type === "checkbox" || field.type === "multiselect") ? [residence] : residence;
+  }
 
   if (/^email/.test(q) && !/other/.test(q)) return SKIP;
   if (/^(full )?name/.test(q)) return SKIP;
