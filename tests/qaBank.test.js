@@ -105,3 +105,16 @@ test("continues to answer Yes for relocation and residence variants", () => {
     );
   }
 });
+
+test('handles supplied CTC, Instahyre-style profile, and factual residence questions', () => {
+  const original = { ...CONFIG.candidate };
+  try {
+    Object.assign(CONFIG.candidate, { currentCtcLpa: 17, expectedCtcLpa: 19, dateOfBirth: '25/04/2000', location: 'Delhi', totalYearsExperience: 5, noticePeriodDays: 0 });
+    assert.equal(matchKnownAnswer('What is your current CTC in INR?', { type: 'number' }), '1700000');
+    assert.equal(matchKnownAnswer('How much annual salary are you expecting? (in LPA, e.g., 45)', { type: 'number' }), '19');
+    assert.equal(matchKnownAnswer('Are you currently living in Kerala?', { type: 'radio', options: ['Yes', 'No'] }), 'No');
+    assert.equal(matchKnownAnswer('How many years of experience do you have in Full stack?', { type: 'radio', options: ['<2 years', '2-5 years', '5-7 years'] }), '2-5 years');
+    assert.equal(matchKnownAnswer('Date of Birth', { type: 'text' }), '25/04/2000');
+    assert.equal(matchKnownAnswer('Are you currently serving notice period?', { type: 'radio', options: ['Yes', 'No'] }), 'No');
+  } finally { Object.assign(CONFIG.candidate, original); }
+});

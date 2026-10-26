@@ -8,7 +8,7 @@
     "login": "node login.js",
     "start": "node apply.js",
     "apply": "node apply.js",
-    "test": "node --test tests/*.test.js"
+    "test": "node --test tests/*.test.js ../shared/questionBank.test.js"
   },
   "engines": {
     "node": ">=18"
